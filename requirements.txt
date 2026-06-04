@@ -1,0 +1,22 @@
+# 核心依赖
+opencv-python>=4.8.0
+numpy>=1.24.0
+pyyaml>=6.0
+requests>=2.31.0
+pillow>=10.0.0
+
+# AI 推理依赖
+mediapipe>=0.10.0
+ultralytics>=8.0.0  # YOLOv8 用于人体和遮挡检测
+
+# 数据存储
+sqlite3
+python-dateutil>=2.8.2
+
+# 系统工具
+psutil>=5.9.0
+gpiod>=2.0.0  # 树莓派 GPIO 支持
+
+# 音频处理 (可选)
+pyaudio>=0.2.13
+librosa>=0.10.0

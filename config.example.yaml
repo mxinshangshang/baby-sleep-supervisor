@@ -1,0 +1,101 @@
+# 婴儿睡眠监护系统配置示例
+# 复制此文件为 config.yaml 并根据实际情况修改
+
+camera:
+  width: 640
+  height: 480
+  fps: 15
+  jpeg_quality: 80
+  format: RGB888
+  device_id: 0
+
+network:
+  host: 127.0.0.1
+  port: 65433
+  recv_timeout_s: 0.2
+  send_timeout_s: 5.0
+
+inference:
+  model_complexity: 1  # 模型复杂度: 0=快, 1=平衡, 2=准
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+  inference_fps: 8
+  display_fps: 10
+  enable_face_detection: true
+  enable_pose_detection: true
+
+detection:
+  # 哭闹检测
+  cry_detection_enabled: true
+  cry_confidence_threshold: 0.7  # 置信度阈值，超过则认为在哭闹
+  cry_duration_threshold: 2.0    # 持续时间阈值，超过则触发告警
+  cry_sensitivity: medium        # 灵敏度: low/medium/high
+
+  # 踢被子/肢体裸露检测
+  limb_exposure_enabled: true
+  exposure_threshold: 0.3        # 裸露皮肤占身体比例阈值
+  exposure_duration_threshold: 5.0  # 持续时间阈值
+
+  # 口鼻遮挡检测
+  occlusion_detection_enabled: true
+  occlusion_threshold: 0.6       # 遮挡置信度阈值
+  occlusion_duration_threshold: 1.0  # 持续时间阈值（危险事件，阈值较小）
+
+  # 区域检测
+  region_detection_enabled: true
+  safe_region: [[50, 50], [590, 430]]  # 安全区域坐标 [左上角, 右下角]
+  region_exit_duration_threshold: 3.0   # 离开区域持续时间阈值
+
+  # 呼吸检测（实验性功能）
+  breath_detection_enabled: false
+  breath_abnormal_threshold: 0.2
+
+supervision:
+  alert_cooldown_s: 60.0  # 同类告警冷却时间，避免重复通知
+  severity_notice_threshold: 30.0
+  severity_warning_threshold: 60.0
+  severity_danger_threshold: 80.0
+  event_retention_days: 30  # 事件和照片保留天数
+
+thermal:
+  enabled: true
+  temp_warn_c: 65.0
+  temp_throttle_c: 75.0
+  temp_check_interval_s: 10.0
+  throttle_inference_fps: 5
+  throttle_model_complexity: 0
+
+process:
+  max_restart_attempts: 5
+  restart_backoff_base_s: 2
+  restart_reset_after_s: 60
+  status_log_interval_s: 30
+
+preview:
+  window_name: Baby Sleep Supervisor
+  show_help: true
+  show_detection_boxes: true
+  show_safe_region: true
+  show_statistics: true
+
+notification:
+  console_enabled: true
+  feishu_enabled: true
+  feishu_webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/你的飞书机器人webhook地址"
+  feishu_secret: ""  # 如果机器人设置了签名校验，填写这里
+  capture_photo_on_alert: true
+  alert_level: "warning"  # 发送通知的最低级别: notice/warning/danger
+
+storage:
+  enabled: true
+  sqlite_path: data/events.db
+  photo_dir: data/photos
+  photo_quality: 90
+  max_photo_size_mb: 1024  # 照片存储最大容量，超过自动清理最早的
+  auto_cleanup_enabled: true
+
+audio:
+  enabled: false
+  device_id: 0
+  sample_rate: 16000
+  cry_detection_enabled: false  # 声音辅助哭闹检测（实验性功能）
