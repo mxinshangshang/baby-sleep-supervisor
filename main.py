@@ -16,7 +16,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Python 路径
 SYSTEM_PYTHON = "/usr/bin/python3"
-VENV_PYTHON = os.path.join(BASE_DIR, "venv_311", "bin", "python")
+VENV_PYTHON = os.path.join(BASE_DIR, "venv", "bin", "python")
 
 # 脚本路径
 CAMERA_SCRIPT = os.path.join(BASE_DIR, "camera_server.py")
@@ -64,7 +64,7 @@ def check_venv():
     """检查 venv 是否存在"""
     if not os.path.exists(VENV_PYTHON):
         print("=" * 60)
-        print("Python 3.11 venv 不存在")
+        print("Python 虚拟环境不存在")
         print("=" * 60)
         print("\n请先运行: python3 setup_venv.py\n")
         return False
@@ -120,7 +120,7 @@ def main():
         print(f"[Main] 摄像头服务器 PID: {camera_state.proc.pid}")
 
     def start_inference():
-        print("[Main] 启动推理客户端 (Python 3.11)...")
+        print("[Main] 启动推理客户端 (虚拟环境 Python)...")
         args = [VENV_PYTHON, INFERENCE_SCRIPT]
         if no_preview:
             args.append("--no-preview")

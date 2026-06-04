@@ -16,10 +16,10 @@ echo ""
 
 # 创建虚拟环境
 echo "2. 创建虚拟环境..."
-if [ ! -d "venv_311" ]; then
-    python3 -m venv venv_311
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
 fi
-source venv_311/bin/activate
+source venv/bin/activate
 echo ""
 
 # 安装基础依赖

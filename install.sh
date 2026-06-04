@@ -52,24 +52,24 @@ echo ""
 echo "4. 创建Python虚拟环境..."
 cd "$(dirname "$0")"
 
-if [ -d "venv_311" ]; then
+if [ -d "venv" ]; then
     echo "虚拟环境已存在，是否删除重建? (y/N)"
     read -r response
     if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo "删除旧虚拟环境..."
-        rm -rf venv_311
+        rm -rf venv
     else
         echo "使用现有虚拟环境"
     fi
 fi
 
-if [ ! -d "venv_311" ]; then
-    python3 -m venv venv_311
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
 fi
 
 # 激活虚拟环境
 echo "激活虚拟环境..."
-source venv_311/bin/activate
+source venv/bin/activate
 echo ""
 
 # 升级pip

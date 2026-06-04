@@ -9,29 +9,26 @@ import subprocess
 import shutil
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VENV_DIR = os.path.join(BASE_DIR, "venv_311")
-PYTHON_BIN = "/usr/bin/python3.11"
+VENV_DIR = os.path.join(BASE_DIR, "venv")
+PYTHON_BIN = sys.executable  # 用当前运行的Python
 REQUIREMENTS = os.path.join(BASE_DIR, "requirements.txt")
 
 
 def check_python_version():
-    """检查 Python 3.11 是否安装"""
-    if not os.path.exists(PYTHON_BIN):
-        print("=" * 60)
-        print("错误：Python 3.11 未安装")
-        print("=" * 60)
-        print("\n请先安装 Python 3.11:")
-        print("sudo apt update")
-        print("sudo apt install python3.11 python3.11-venv python3.11-dev\n")
-        return False
-
-    # 检查版本
+    """检查 Python 版本是否符合要求 (>=3.9)"""
     result = subprocess.run([PYTHON_BIN, "--version"], capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"Python 3.11 执行失败: {result.stderr}")
+        print(f"Python 执行失败: {result.stderr}")
         return False
 
-    print(f"Python 版本: {result.stdout.strip()}")
+    version_info = sys.version_info
+    if version_info.major < 3 or version_info.minor < 9:
+        print("=" * 60)
+        print(f"错误：Python 版本需要 >= 3.9，当前版本: {sys.version}")
+        print("=" * 60)
+        return False
+
+    print(f"Python 版本: {result.stdout.strip()} ✓")
     return True
 
 
@@ -47,7 +44,7 @@ def create_venv():
             print("使用现有虚拟环境")
             return True
 
-    print("\n正在创建 Python 3.11 虚拟环境...")
+    print("\n正在创建 Python 虚拟环境...")
     result = subprocess.run([PYTHON_BIN, "-m", "venv", VENV_DIR])
     if result.returncode != 0:
         print("虚拟环境创建失败")
@@ -106,10 +103,10 @@ def main():
     print("=" * 60)
     print(f"\n虚拟环境路径: {VENV_DIR}")
     print("\n启动命令:")
-    print("  带预览模式: /usr/bin/python3 main.py")
-    print("  无头模式:   /usr/bin/python3 main.py --no-preview")
+    print("  带预览模式: ./start.sh")
+    print("  无头模式:   ./start_headless.sh")
     print("\n区域校准:")
-    print("  /usr/bin/python3 calibrate_region.py")
+    print("  ./calibrate_region.py")
     print("\n")
 
     return 0
