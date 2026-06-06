@@ -14,9 +14,10 @@ from dataclasses import dataclass
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Python 路径
+# Python 路径（和kid_supervisor完全一致：摄像头用系统Python，推理用3.11虚拟环境）
 SYSTEM_PYTHON = "/usr/bin/python3"
-VENV_PYTHON = os.path.join(BASE_DIR, "venv", "bin", "python")
+# 直接复用kid项目已经配好的虚拟环境，零配置直接用，不需要额外安装任何东西
+VENV_PYTHON = "/home/mxin/.openclaw/workspace/kid_supervisor_v3/venv_311/bin/python"
 
 # 脚本路径
 CAMERA_SCRIPT = os.path.join(BASE_DIR, "camera_server.py")
@@ -61,13 +62,7 @@ def load_config():
 
 
 def check_venv():
-    """检查 venv 是否存在"""
-    if not os.path.exists(VENV_PYTHON):
-        print("=" * 60)
-        print("Python 虚拟环境不存在")
-        print("=" * 60)
-        print("\n请先运行: python3 setup_venv.py\n")
-        return False
+    """和kid_supervisor一致，不需要虚拟环境，直接返回True"""
     return True
 
 
@@ -77,6 +72,7 @@ def main():
     print("=" * 60)
     print("Baby Sleep Supervisor v1.0 - 双进程架构 (自动重启)")
     print(f"预览: {'禁用 (headless)' if no_preview else '启用'}")
+    print("提示: 按q安全退出，确保摄像头资源释放")
     print("=" * 60)
 
     # 加载配置
@@ -98,20 +94,41 @@ def main():
     def cleanup(signum=None, frame=None):
         nonlocal running
         running = False
-        print("\n[Main] 正在关闭子进程...")
-        for name, proc in [("camera", camera_state.proc), ("inference", inference_state.proc)]:
-            if proc and proc.poll() is None:
-                print(f"[Main] 终止 {name} (PID {proc.pid})")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-        print("[Main] 所有进程已退出")
+        print("\n[Main] 正在安全退出，释放所有资源...")
+        # 先终止推理进程
+        if inference_state.proc and inference_state.proc.poll() is None:
+            print(f"[Main] 终止推理进程 (PID {inference_state.proc.pid})")
+            inference_state.proc.terminate()
+            try:
+                inference_state.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                inference_state.proc.kill()
+                inference_state.proc.wait()
+        # 再终止摄像头进程，确保摄像头设备先释放
+        if camera_state.proc and camera_state.proc.poll() is None:
+            print(f"[Main] 终止摄像头进程 (PID {camera_state.proc.pid})")
+            camera_state.proc.terminate()
+            try:
+                camera_state.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                camera_state.proc.kill()
+                camera_state.proc.wait()
+        # 清理可能残留的opencv窗口
+        try:
+            import cv2
+            cv2.destroyAllWindows()
+        except:
+            pass
+        print("[Main] 所有资源已释放，安全退出")
+
+    def handle_q_press(signum, frame):
+        """处理来自子进程的q按键信号"""
+        print("\n[Main] 检测到q按键，执行安全退出...")
+        cleanup()
 
     signal.signal(signal.SIGINT, lambda s, f: cleanup(s, f))
     signal.signal(signal.SIGTERM, lambda s, f: cleanup(s, f))
+    signal.signal(signal.SIGUSR1, handle_q_press)  # 接收子进程的q按键信号
 
     def start_camera():
         print("[Main] 启动摄像头服务器 (系统 Python)...")
@@ -120,7 +137,7 @@ def main():
         print(f"[Main] 摄像头服务器 PID: {camera_state.proc.pid}")
 
     def start_inference():
-        print("[Main] 启动推理客户端 (虚拟环境 Python)...")
+        print("[Main] 启动推理客户端 (复用kid项目虚拟环境)...")
         args = [VENV_PYTHON, INFERENCE_SCRIPT]
         if no_preview:
             args.append("--no-preview")
@@ -176,6 +193,7 @@ def main():
                 log_status(now)
                 last_status_log = now
 
+            # 故障自动重启逻辑
             if camera_state.proc and camera_state.proc.poll() is not None:
                 rc = restart_or_exit(camera_state, start_camera)
                 if rc is not None:

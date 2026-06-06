@@ -78,9 +78,15 @@ Baby Sleep Supervisor 面向婴幼儿睡眠场景，强调三点：
 
 ### 1. 环境准备
 
+当前树莓派运行方式复用现有环境：
+
+- 摄像头采集进程使用系统 Python：`/usr/bin/python3`
+- 推理进程复用 `kid_supervisor_v3` 已配置好的 Python 3.11 虚拟环境：`/home/mxin/.openclaw/workspace/kid_supervisor_v3/venv_311/bin/python`
+
+因此正常运行不需要在 Baby 项目里重复安装 MediaPipe。
+
 ```bash
 cd /home/mxin/.openclaw/workspace/baby_sleep_supervisor
-python3 setup_venv.py
 ```
 
 ### 2. 配置参数
@@ -91,10 +97,10 @@ python3 setup_venv.py
 
 ```bash
 # 带预览窗口模式
-/usr/bin/python3 main.py
+./start.sh
 
 # 无头后台模式
-/usr/bin/python3 main.py --no-preview
+./start_headless.sh
 ```
 
 ---
@@ -108,9 +114,11 @@ python3 setup_venv.py
 ```
 
 步骤：
-1. 在预览窗口中用鼠标框选婴儿床的安全区域
-2. 按 `s` 保存配置
-3. 配置自动写回 `config.yaml`
+1. 启动后默认不显示旧区域，直接等待新的四点输入
+2. 依次左键点击婴儿床四个角点，第四个点后自动闭合并锁定区域
+3. 如果想重画，继续点击第五个点会清空前四点并开始新一轮四点输入
+4. 右键或 `u` 撤销未完成的上一个点，`r` 重置全部点
+5. 按 `s` 保存配置，配置自动写回 `config.yaml`
 
 ---
 
@@ -134,15 +142,202 @@ baby_sleep_supervisor/
 │   ├── preview_renderer.py # 预览窗口渲染
 │   ├── storage.py          # 数据存储模块
 │   └── vision/
-│       ├── face_detector.py    # 人脸/表情检测
-│       ├── body_detector.py    # 人体/肢体检测
-│       ├── occlusion_detector.py  # 遮挡检测
+│       ├── face_detector.py    # 人脸/表情/口鼻遮挡检测
+│       ├── body_detector.py    # 人体姿态/肢体裸露检测
 │       └── region_detector.py  # 区域检测
 ├── data/
 │   ├── photos/             # 异常事件抓拍照片
 │   └── events.db           # 事件数据库
 └── docs/                   # 文档目录
 ```
+
+---
+
+## 当前代码设计
+
+### 双进程运行模型
+
+系统由 `main.py` 统一管理两个子进程：
+
+1. `camera_server.py` 使用系统 Python 启动，负责 Picamera2 摄像头初始化、采集、JPEG 编码和 TCP 帧发送。
+2. `inference_client.py` 使用 `kid_supervisor_v3` 的 Python 3.11 虚拟环境启动，负责接收帧、运行 MediaPipe/OpenCV 推理、渲染预览和触发告警。
+
+这样可以把摄像头驱动依赖和 AI 推理依赖隔离开：摄像头继续使用 Raspberry Pi OS 原生 `picamera2` 环境，推理继续复用已经验证可用的 MediaPipe 环境。
+
+### 主进程守护与退出策略
+
+`main.py` 会监控摄像头进程和推理进程的状态：
+
+- 子进程异常退出后按配置自动重启。
+- 稳定运行超过 `restart_reset_after_s` 后清零重启计数。
+- 超过 `max_restart_attempts` 后执行安全退出。
+- `SIGINT` / `SIGTERM` 会先停止推理进程，再停止摄像头进程，最后销毁 OpenCV 窗口。
+
+预览模式下 `q` 键由推理进程向主进程发送 `SIGUSR1`，主进程按以下顺序安全退出：
+
+1. 先终止推理进程，再终止摄像头进程。
+2. 销毁残留 OpenCV 窗口。
+3. 确保 Camera Module 3 Wide 占用释放。
+
+不支持通过 `q` 重启程序；如需重启，退出后重新执行 `./start.sh`。
+
+### 检测流水线
+
+`SleepSupervisor` 是监督核心，按帧执行以下逻辑：
+
+1. 姿态检测：作为人体存在和区域判断的主链路，支持侧脸、背脸、局部身体可见等睡姿。
+2. 人脸检测和 Face Mesh：作为存在性增强证据，并在 Face Mesh 可靠时用于哭闹和口鼻遮挡判断。
+3. Presence 确认：综合姿态关键点、头/躯干锚点、人脸框和分割掩码，连续多帧确认画面中确实有婴儿。
+4. 时间窗口平滑：对 presence、哭闹置信度、遮挡置信度、裸露比例做滑动平均，降低瞬时误报。
+5. 持续时间判断：异常必须持续超过配置阈值才保存事件和发送告警。
+6. 冷却控制：同类事件在冷却时间内不会重复通知。
+
+异常事件会保存到 SQLite，并把抓拍照片写入 `data/photos/`。
+
+### 安全区域设计
+
+区域检测支持两种配置格式：
+
+```yaml
+# 旧版矩形，两点对角线
+safe_region: [[50, 50], [590, 430]]
+
+# 新版多边形，推荐四点区域
+safe_region:
+  - [126, 95]
+  - [122, 364]
+  - [538, 378]
+  - [536, 88]
+```
+
+`RegionDetector` 会根据配置自动识别矩形或多边形。多边形模式使用 `cv2.pointPolygonTest` 判断中心点是否在区域内，并用身体边界框的角点和中心点估算与安全区域的重叠比例。满足中心点在区域内或重叠比例超过 70% 时认为仍在安全区域内。
+
+区域告警还会先判断是否存在有效人体：系统使用姿态关键点、头部/躯干锚点、人脸框和连续帧 presence 分数确认画面中确实有婴儿。空床或 MediaPipe 偶发误识别时不会触发离开区域告警。
+
+区域判断优先使用躯干和头部，而不是单纯依赖全身 bbox：如果躯干中心、躯干重叠、头部中心或身体主体仍在 Safe Region 内，就不会因为单个手脚伸出区域而误报离区。
+
+侧脸/背脸睡觉时，人脸可能没有 Face Mesh，但姿态和头/躯干仍可确认 presence 和区域状态；“脸不可见”不会被当成口鼻遮挡。
+
+### 预览界面设计
+
+预览界面使用 OpenCV `putText` 渲染，因此当前 UI 文案统一使用英文和 ASCII，避免中文或 emoji 在 OpenCV 窗口中显示成 `?`。
+
+预览窗口支持：
+
+- 检测状态叠加：Cry、Occlusion、Exposure、In Region。
+- 安全区域叠加：矩形或四点多边形、半透明填充和顶点标记。
+- 快捷键开关：帮助、检测框、安全区域、统计信息。
+- 最近事件临时显示。
+
+### 飞书通知链路
+
+通知模块优先复用已经打通的 OpenClaw 飞书 App 通道：
+
+1. 运行时只读 `/home/mxin/.openclaw/openclaw.json`，读取已有 Feishu App 配置。
+2. 只读 OpenClaw session 索引，找到最近的飞书 `open_id`。
+3. 通过 Feishu tenant access token 发送文本消息。
+4. 对异常抓拍图片先调用 Feishu 图片上传接口获取 `image_key`，再发送图片消息。
+5. 如果 OpenClaw 通道不可用，则回退到 `config.yaml` 中配置的 webhook 发送方式。
+
+该设计不会修改 OpenClaw 自身配置或功能，只是 Baby 项目在运行时读取并复用已有通道。
+
+### 模块职责
+
+| 模块 | 职责 | 关键点 |
+|------|------|--------|
+| `main.py` | 主启动器和守护进程 | 管理摄像头/推理两个子进程，处理自动重启、安全退出和 `q` 键信号 |
+| `camera_server.py` | 摄像头采集服务 | 使用 Picamera2 获取画面，通过 TCP 向推理端发送 JPEG 帧 |
+| `inference_client.py` | 推理客户端 | 连接摄像头服务，解码帧，调用监督器，渲染预览，处理快捷键 |
+| `calibrate_region.py` | 安全区域标定工具 | 在摄像头预览中手动点击四个角点，保存到 `config.yaml` |
+| `src/config.py` | 配置加载 | 读取 YAML 配置并准备数据目录 |
+| `src/supervision.py` | 监督核心 | 串联人脸、姿态、区域、存储和通知逻辑 |
+| `src/notifier.py` | 通知模块 | 发送控制台、飞书文本和飞书图片通知，优先复用 OpenClaw 通道 |
+| `src/storage.py` | 本地存储 | 保存异常照片和 SQLite 事件记录 |
+| `src/preview_renderer.py` | 预览渲染 | 绘制检测状态、安全区域、事件提示和快捷键帮助 |
+| `src/vision/face_detector.py` | 人脸检测 | MediaPipe 人脸检测、Face Mesh、哭闹表情和口鼻遮挡特征 |
+| `src/vision/body_detector.py` | 姿态检测 | MediaPipe Pose、身体关键点和肢体裸露估算 |
+| `src/vision/region_detector.py` | 区域检测 | 矩形/多边形安全区域判断和区域绘制 |
+
+### 端到端数据流
+
+```text
+Camera Module 3 Wide
+        |
+        v
+camera_server.py
+  Picamera2 capture_array()
+  OpenCV JPEG encode
+  TCP socket send
+        |
+        v
+inference_client.py
+  TCP receive
+  JPEG decode
+  SleepSupervisor.process_frame()
+        |
+        +--> FaceDetector: 人脸、表情、口鼻遮挡
+        +--> BodyDetector: 姿态、肢体裸露
+        +--> RegionDetector: 是否在安全区域内
+        |
+        v
+事件判断
+  平滑窗口
+  持续时间阈值
+  冷却时间
+        |
+        +--> Storage: 保存照片和事件数据库
+        +--> Notifier: 控制台/飞书文本/飞书图片
+        +--> PreviewRenderer: 预览窗口叠加显示
+```
+
+摄像头进程和推理进程之间只传输图像帧，不直接共享摄像头对象。推理进程异常时不会直接持有摄像头设备，主进程可以更可靠地释放并重启摄像头服务。
+
+### 异常事件生命周期
+
+一次异常从画面变化到最终通知，经过以下阶段：
+
+1. **单帧检测**：从当前帧提取人脸、姿态、皮肤区域、安全区域等特征。
+2. **置信度计算**：得到哭闹置信度、遮挡置信度、裸露比例或区域状态。
+3. **滑动平滑**：将最近多帧结果放入窗口求均值，减少单帧噪声。
+4. **持续时间确认**：异常状态首次出现时记录开始时间，持续超过阈值才进入告警。
+5. **冷却判断**：同类事件在冷却窗口内只保留状态，不重复发送通知。
+6. **事件落盘**：保存抓拍照片，写入 SQLite 事件记录，生成事件 ID。
+7. **通知发送**：构造文本内容，发送飞书文本；如果有照片且配置允许，再发送图片。
+8. **预览反馈**：在窗口中显示当前异常状态和最近事件。
+
+该生命周期用于降低误报：单帧识别结果不会直接触发通知，必须经过平滑、持续时间和冷却控制。
+
+### 检测策略细节
+
+| 事件 | 输入来源 | 主要判断 | 默认级别 |
+|------|----------|----------|----------|
+| 哭闹 | Presence + Face Mesh | 嘴部、眼部、眉部等表情特征组合后的置信度；侧脸/无 Face Mesh 时不判断 | warning / danger |
+| 口鼻遮挡 | Presence + Face Mesh + 图像 ROI | 口鼻区域皮肤比例、纹理、边缘等特征；脸不可见不等于遮挡 | danger |
+| 踢被子/肢体裸露 | Presence + Pose + 图像颜色特征 | 可见肢体区域和裸露比例 | warning |
+| 离开安全区域 | Presence + Pose + RegionDetector | 优先判断躯干和头部，再参考身体主体重叠 | warning |
+
+当前实现偏向轻量级本地推理和启发式规则组合，避免在树莓派上运行过重模型导致长期稳定性下降。
+
+### 飞书图片通知细节
+
+异常事件带图片时，通知模块会按以下顺序处理：
+
+1. 将本地抓拍图缩放到飞书限制以内。
+2. 使用 OpenClaw Feishu App 凭据获取 `tenant_access_token`。
+3. 调用飞书图片上传接口上传 JPEG，获取 `image_key`。
+4. 使用 `image_key` 发送图片消息给最近 OpenClaw 飞书会话对应的 `open_id`。
+5. 如果 OpenClaw App 通道失败，则尝试 webhook 回退逻辑。
+
+OpenClaw 的配置和会话文件只读访问。Baby 项目不会写入 OpenClaw 配置，也不会改变 OpenClaw 自身消息收发行为。
+
+### 本地存储设计
+
+异常数据分为两类保存：
+
+- 图片文件：保存到 `data/photos/` 下，文件名包含时间信息，便于人工查找。
+- 事件记录：保存到 SQLite 数据库 `data/events.db`，记录事件类型、级别、消息、详情和图片路径。
+
+存储层和通知层解耦：即使飞书发送失败，事件和照片仍会先保存在本地，便于事后排查。
 
 ---
 
@@ -173,16 +368,22 @@ detection:
   occlusion_detection_enabled: true
   occlusion_threshold: 0.6
   
-  # 区域检测
+  # 区域检测，支持两点矩形或四点/多点多边形
   region_detection_enabled: true
-  safe_region: [[50, 50], [590, 430]]
+  safe_region:
+    - [126, 95]
+    - [122, 364]
+    - [538, 378]
+    - [536, 88]
 
 # 通知配置
 notification:
   feishu_enabled: true
-  feishu_webhook: "your-webhook-url"
-  alert_cooldown_s: 60.0
+  feishu_webhook: "your-webhook-url"  # OpenClaw 通道不可用时的回退 webhook
   capture_photo_on_alert: true
+
+supervision:
+  alert_cooldown_s: 60.0
 
 # 存储配置
 storage:
@@ -206,11 +407,53 @@ storage:
 
 ## 当前实现边界
 
-当前版本优先保证可靠性和低误报，暂不实现：
-1. 云端同步
-2. 语音对讲
-3. 多摄像头协同
-4. 复杂AI模型
+当前版本优先保证可靠性、可运行性和低误报，以下是当前实现边界：
+
+### 已实现并作为主链路使用
+
+1. 单摄像头本地监护。
+2. 摄像头采集和 AI 推理双进程隔离。
+3. MediaPipe 人脸、Face Mesh、Pose 推理。
+4. 哭闹表情启发式检测。
+5. 口鼻遮挡启发式检测。
+6. 肢体裸露/踢被子启发式检测。
+7. 矩形或四点/多点多边形安全区域检测。
+8. 异常事件抓拍和 SQLite 事件记录。
+9. OpenClaw 飞书通道复用，支持异常文本和图片通知。
+10. 预览模式和无头后台模式。
+11. 子进程异常自动重启和 `q` 键安全重启/退出。
+
+### 配置存在但不是当前主链路
+
+1. 声音哭闹检测配置存在，但当前核心告警链路主要依赖视觉表情检测。
+2. 呼吸异常相关配置存在，但当前版本没有把呼吸检测作为稳定主功能。
+3. 温控配置存在，后续可以继续接入动态调节推理帧率和模型复杂度。
+
+### 当前技术限制
+
+1. 哭闹、遮挡、踢被子检测使用轻量级启发式规则，不等同于医疗级判断。
+2. 多边形区域重叠判断采用角点和中心点估算，不是像素级精确 IoU。
+3. OpenClaw 飞书接收人当前通过最近会话自动发现，如果最近会话不是目标接收人，可能需要后续改为显式配置。
+4. OpenCV 预览窗口使用 `putText`，中文和 emoji 可能显示为 `?`，因此 UI 文案使用英文。
+5. 系统假设同一时间只有一个摄像头服务占用 Camera Module 3 Wide。
+6. 当前不做云端同步，所有图片和事件默认只保存在本机。
+
+### 暂不实现
+
+1. 云端同步。
+2. 语音对讲。
+3. 多摄像头协同。
+4. 医疗级呼吸监测。
+5. 重量级目标检测模型常驻运行。
+
+### 后续可改进方向
+
+1. 将飞书 `receive_id` 改为 Baby 项目显式配置，减少对最近 OpenClaw 会话的依赖。
+2. 缓存 Feishu `tenant_access_token`，减少频繁请求 token。
+3. 为异常检测增加离线回放工具，用已保存照片或视频调参。
+4. 增加更细的事件统计页面，例如每晚异常次数、持续时间和趋势。
+5. 根据树莓派温度动态降低推理帧率或模型复杂度。
+6. 将声音哭闹检测接入主事件链路，作为视觉哭闹检测的辅助证据。
 
 ---
 

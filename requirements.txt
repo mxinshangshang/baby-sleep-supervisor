@@ -4,19 +4,14 @@ numpy>=1.24.0
 pyyaml>=6.0
 requests>=2.31.0
 pillow>=10.0.0
-
-# AI 推理依赖
-mediapipe>=0.10.0
-ultralytics>=8.0.0  # YOLOv8 用于人体和遮挡检测
-
-# 数据存储
-sqlite3
 python-dateutil>=2.8.2
-
-# 系统工具
 psutil>=5.9.0
-gpiod>=2.0.0  # 树莓派 GPIO 支持
 
-# 音频处理 (可选)
-pyaudio>=0.2.13
-librosa>=0.10.0
+# AI 推理依赖（系统已预装，不需要在虚拟环境重复安装）
+# mediapipe>=0.10.0
+# ultralytics>=8.0.0
+
+# 可选依赖，需要时自行安装
+# gpiod>=2.0.0          # 树莓派 GPIO 支持
+# pyaudio>=0.2.13      # 音频处理
+# librosa>=0.10.0      # 音频分析

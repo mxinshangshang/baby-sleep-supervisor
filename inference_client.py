@@ -147,8 +147,8 @@ def main():
 
                     # 处理快捷键
                     if key == ord('q'):
-                        running = False
-                        break
+                        # 发送信号给主进程，由主进程决定重启还是退出
+                        os.kill(os.getppid(), signal.SIGUSR1)
                     elif key == ord('h'):
                         renderer.show_help = not renderer.show_help
                     elif key == ord('d'):
@@ -186,9 +186,7 @@ def main():
         if renderer:
             renderer.close()
 
-        # 发送停止通知
         notifier.send_system_notification("婴儿监护系统已停止")
-
         print("系统已正常退出")
 
     return 0

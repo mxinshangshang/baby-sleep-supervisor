@@ -1,5 +1,5 @@
 #!/bin/bash
-# 带预览模式启动脚本
+# 带预览模式启动脚本（和kid_supervisor完全一致）
 
 cd "$(dirname "$0")"
 

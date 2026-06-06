@@ -43,8 +43,27 @@ detection:
 
   # 区域检测
   region_detection_enabled: true
-  safe_region: [[50, 50], [590, 430]]  # 安全区域坐标 [左上角, 右下角]
-  region_exit_duration_threshold: 3.0   # 离开区域持续时间阈值
+  safe_region: [[50, 50], [590, 430]]  # 也支持四点/多点多边形
+  region_exit_duration_threshold: 3.0
+
+  # 人体存在确认：姿态主导，人脸增强，兼容侧脸/背脸
+  presence_window_size: 8
+  presence_score_threshold: 0.55
+  presence_confirm_ratio: 0.6
+  presence_uncertain_grace_s: 2.0
+  pose_visibility_threshold: 0.5
+  pose_min_visible_landmarks: 6
+  pose_min_core_landmarks: 2
+  pose_min_body_bbox_area: 1800
+  pose_min_torso_bbox_area: 500
+  pose_bbox_padding_px: 12
+  head_bbox_padding_px: 20
+  face_min_bbox_area: 900
+  region_body_overlap_threshold: 0.55
+  region_torso_overlap_threshold: 0.50
+  region_exit_window_size: 8
+  region_exit_confirm_ratio: 0.7
+  alert_requires_confirmed_presence: true
 
   # 呼吸检测（实验性功能）
   breath_detection_enabled: false

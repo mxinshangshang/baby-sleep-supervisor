@@ -8,8 +8,9 @@ import json
 import base64
 import hashlib
 import hmac
+import re
 import requests
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from PIL import Image
 import io
 from datetime import datetime
@@ -54,6 +55,8 @@ class Notifier:
             "danger": "危险"
         }
 
+        self.openclaw_cfg, self.openclaw_receive_id = self._load_openclaw_feishu_config()
+
     def _should_send_alert(self, event_type: str, level: str) -> bool:
         """检查是否应该发送告警"""
         # 检查级别是否足够
@@ -81,6 +84,139 @@ class Notifier:
         sign = base64.b64encode(hmac_code).decode("utf-8")
         return sign
 
+    def _load_openclaw_feishu_config(self) -> Tuple[Optional[Dict], Optional[str]]:
+        """复用OpenClaw已打通的飞书App配置和最近会话ID"""
+        config_path = "/home/mxin/.openclaw/openclaw.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                oc_cfg = json.load(f)
+            feishu_cfg = oc_cfg.get("channels", {}).get("feishu", {})
+            if not feishu_cfg.get("enabled"):
+                return None, None
+
+            receive_id = self._find_openclaw_feishu_receive_id()
+            if not receive_id:
+                print("OpenClaw Feishu receive_id not found; text webhook fallback will be used")
+                return feishu_cfg, None
+            return feishu_cfg, receive_id
+        except Exception as e:
+            print(f"OpenClaw Feishu config load failed: {e}")
+            return None, None
+
+    def _find_openclaw_feishu_receive_id(self) -> Optional[str]:
+        """从OpenClaw会话索引中提取最近的飞书open_id"""
+        candidates = [
+            "/home/mxin/.openclaw/agents/claude/sessions/sessions.json",
+            "/home/mxin/.openclaw/agents/main/sessions/sessions.json",
+        ]
+        pattern = re.compile(r"feishu:(?:direct|group):([A-Za-z0-9_\-]+)")
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                matches = pattern.findall(text)
+                if matches:
+                    return matches[-1]
+            except Exception:
+                continue
+        return None
+
+    def _openclaw_tenant_access_token(self) -> Optional[str]:
+        if not self.openclaw_cfg:
+            return None
+        try:
+            response = requests.post(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                json={
+                    "app_id": self.openclaw_cfg.get("appId"),
+                    "app_secret": self.openclaw_cfg.get("appSecret"),
+                },
+                timeout=10,
+            )
+            data = response.json()
+            if data.get("code") == 0:
+                return data.get("tenant_access_token")
+            print(f"OpenClaw Feishu token failed: {data}")
+        except Exception as e:
+            print(f"OpenClaw Feishu token request failed: {e}")
+        return None
+
+    def _openclaw_send_text(self, content: str) -> bool:
+        if not self.openclaw_receive_id:
+            return False
+        token = self._openclaw_tenant_access_token()
+        if not token:
+            return False
+        try:
+            response = requests.post(
+                "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={
+                    "receive_id": self.openclaw_receive_id,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": content}, ensure_ascii=False),
+                },
+                timeout=10,
+            )
+            data = response.json()
+            if data.get("code") == 0:
+                return True
+            print(f"OpenClaw Feishu text send failed: {data}")
+        except Exception as e:
+            print(f"OpenClaw Feishu text send failed: {e}")
+        return False
+
+    def _openclaw_upload_image(self, image_path: str) -> Optional[str]:
+        token = self._openclaw_tenant_access_token()
+        if not token:
+            return None
+        try:
+            img_bytes = self._resize_image(image_path)
+            files = {"image": (os.path.basename(image_path), img_bytes, "image/jpeg")}
+            data = {"image_type": "message"}
+            response = requests.post(
+                "https://open.feishu.cn/open-apis/im/v1/images",
+                headers={"Authorization": f"Bearer {token}"},
+                data=data,
+                files=files,
+                timeout=20,
+            )
+            payload = response.json()
+            if payload.get("code") == 0:
+                return payload.get("data", {}).get("image_key")
+            print(f"OpenClaw Feishu image upload failed: {payload}")
+        except Exception as e:
+            print(f"OpenClaw Feishu image upload failed: {e}")
+        return None
+
+    def _openclaw_send_image(self, image_path: str) -> bool:
+        if not self.openclaw_receive_id or not os.path.exists(image_path):
+            return False
+        token = self._openclaw_tenant_access_token()
+        if not token:
+            return False
+        image_key = self._openclaw_upload_image(image_path)
+        if not image_key:
+            return False
+        try:
+            response = requests.post(
+                "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={
+                    "receive_id": self.openclaw_receive_id,
+                    "msg_type": "image",
+                    "content": json.dumps({"image_key": image_key}),
+                },
+                timeout=10,
+            )
+            data = response.json()
+            if data.get("code") == 0:
+                return True
+            print(f"OpenClaw Feishu image send failed: {data}")
+        except Exception as e:
+            print(f"OpenClaw Feishu image send failed: {e}")
+        return False
+
     def _resize_image(self, image_path: str, max_size: int = 10 * 1024 * 1024) -> bytes:
         """调整图片大小，确保不超过飞书限制"""
         with Image.open(image_path) as img:
@@ -92,8 +228,9 @@ class Notifier:
                 img = img.resize(new_size, Image.Resampling.LANCZOS)
 
             # 保存到字节流
+            quality = 85
             img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='JPEG', quality=85)
+            img.save(img_byte_arr, format='JPEG', quality=quality)
             img_bytes = img_byte_arr.getvalue()
 
             # 如果还是太大，继续降低质量
@@ -107,6 +244,9 @@ class Notifier:
 
     def send_feishu_text(self, content: str) -> bool:
         """发送文本消息到飞书"""
+        if self.feishu_enabled and self._openclaw_send_text(content):
+            return True
+
         if not self.feishu_enabled or not self.feishu_webhook:
             return False
 
@@ -140,6 +280,9 @@ class Notifier:
 
     def send_feishu_image(self, image_path: str, title: str = "") -> bool:
         """发送图片消息到飞书"""
+        if self.feishu_enabled and self._openclaw_send_image(image_path):
+            return True
+
         if not self.feishu_enabled or not self.feishu_webhook or not os.path.exists(image_path):
             return False
 

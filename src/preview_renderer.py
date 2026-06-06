@@ -1,6 +1,6 @@
 """
-预览渲染模块
-负责在帧上绘制检测结果和UI元素
+Preview Renderer
+Draw detection results and UI elements on frame
 """
 import cv2
 import numpy as np
@@ -23,14 +23,16 @@ class PreviewRenderer:
 
         # 颜色定义
         self.COLORS = {
-            "normal": (0, 255, 0),      # 绿色 - 正常
-            "warning": (0, 255, 255),   # 黄色 - 警告
-            "danger": (0, 0, 255),      # 红色 - 危险
-            "text": (255, 255, 255),    # 白色 - 文字
-            "text_bg": (0, 0, 0),       # 黑色 - 文字背景
-            "region": (0, 255, 0),      # 绿色 - 安全区域
-            "face": (255, 0, 0),        # 蓝色 - 人脸框
-            "pose": (255, 255, 0),      # 青色 - 姿态关键点
+            "normal": (0, 255, 0),      # Green - Normal
+            "warning": (0, 255, 255),   # Yellow - Warning
+            "danger": (0, 0, 255),      # Red - Danger
+            "text": (255, 255, 255),    # White - Text
+            "text_bg": (0, 0, 0),       # Black - Text background
+            "region": (0, 255, 0),      # Green - Safe region
+            "face": (255, 0, 0),        # Blue - Face box
+            "pose": (255, 255, 0),      # Cyan - Pose keypoints
+            "torso": (255, 0, 255),     # Purple - Torso box
+            "head": (0, 165, 255),      # Orange - Head box
         }
 
         # 字体设置
@@ -97,14 +99,31 @@ class PreviewRenderer:
         """绘制检测结果"""
         detections = results.get("detections", {})
 
+        if "presence" in detections:
+            presence = detections["presence"]
+            confirmed = presence.get("confirmed", False)
+            score = presence.get("smoothed_score", 0.0)
+            status = "Yes" if confirmed else "Uncertain" if score > 0 else "No"
+            color = self.COLORS["normal"] if confirmed else self.COLORS["warning"] if score > 0 else self.COLORS["text"]
+            cv2.putText(frame, f"Presence: {status} {score:.2f}", (10, 30), self.FONT,
+                        self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
+
+        if "face_summary" in detections:
+            face_summary = detections["face_summary"]
+            face_mode = face_summary.get("mode", "not_visible")
+            face_text = "Mesh" if face_mode == "frontal_or_mesh" else "BBox side" if face_mode == "bbox_only_possible_side_face" else "Not visible"
+            face_count = face_summary.get("face_count", 0)
+            face_conf = face_summary.get("main_face_confidence", 0.0)
+            cv2.putText(frame, f"Face: {face_text} n={face_count} c={face_conf:.2f}", (10, 50), self.FONT,
+                        self.FONT_SCALE_NORMAL, self.COLORS["text"], self.FONT_THICKNESS)
+
         # 绘制哭闹检测结果
         if "cry" in detections:
             cry_data = detections["cry"]
             confidence = cry_data["confidence"]
             color = self.COLORS["danger"] if confidence > 0.7 else self.COLORS["warning"] if confidence > 0.5 else self.COLORS["normal"]
-
-            text = f"Cry: {confidence:.2f}"
-            cv2.putText(frame, text, (10, 30), self.FONT,
+            text = f"Cry: {confidence:.2f}" if cry_data.get("status") == "available" else "Cry: N/A"
+            cv2.putText(frame, text, (10, 70), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
 
         # 绘制遮挡检测结果
@@ -113,8 +132,8 @@ class PreviewRenderer:
             confidence = occlusion_data["confidence"]
             color = self.COLORS["danger"] if confidence > 0.6 else self.COLORS["warning"] if confidence > 0.3 else self.COLORS["normal"]
 
-            text = f"Occlusion: {confidence:.2f}"
-            cv2.putText(frame, text, (10, 50), self.FONT,
+            text = f"Occlusion: {confidence:.2f}" if occlusion_data.get("status") == "available" else "Occlusion: N/A"
+            cv2.putText(frame, text, (10, 90), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
 
             # 绘制口鼻区域框
@@ -128,31 +147,37 @@ class PreviewRenderer:
             ratio = exposure_data["ratio"]
             color = self.COLORS["danger"] if ratio > 0.5 else self.COLORS["warning"] if ratio > 0.3 else self.COLORS["normal"]
 
-            text = f"Exposure: {ratio:.2f}"
-            cv2.putText(frame, text, (10, 70), self.FONT,
+            text = f"Exposure: {ratio:.2f}" if exposure_data.get("status") == "available" else "Exposure: N/A"
+            cv2.putText(frame, text, (10, 110), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
 
             # 显示裸露肢体
             exposed_limbs = exposure_data["features"].get("exposed_limbs", [])
             if exposed_limbs:
                 limbs_text = f"Limbs: {', '.join(exposed_limbs)}"
-                cv2.putText(frame, limbs_text, (10, 90), self.FONT,
+                cv2.putText(frame, limbs_text, (10, 130), self.FONT,
                             self.FONT_SCALE_SMALL, color, self.FONT_THICKNESS)
 
         # 绘制区域检测结果
         if "region" in detections:
             region_data = detections["region"]
-            in_region = region_data["in_region"]
-            color = self.COLORS["normal"] if in_region else self.COLORS["danger"]
+            features = region_data["features"]
+            status = region_data.get("status", "in_region" if region_data["in_region"] else "out_of_region")
+            color = self.COLORS["danger"] if status == "out_of_region" else self.COLORS["warning"] if status == "uncertain" else self.COLORS["normal"]
 
-            text = f"In Region: {'Yes' if in_region else 'No'}"
-            cv2.putText(frame, text, (10, 110), self.FONT,
+            text = f"Region: {status}"
+            cv2.putText(frame, text, (10, 150), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
 
-            # 绘制人体边界框
-            if "body_bbox" in region_data["features"]:
-                x1, y1, x2, y2 = region_data["features"]["body_bbox"]
+            if features.get("body_bbox"):
+                x1, y1, x2, y2 = features["body_bbox"]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            if features.get("torso_bbox"):
+                x1, y1, x2, y2 = features["torso_bbox"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), self.COLORS["torso"], 2)
+            if features.get("head_bbox"):
+                x1, y1, x2, y2 = features["head_bbox"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), self.COLORS["head"], 2)
 
         return frame
 
@@ -220,15 +245,15 @@ class PreviewRenderer:
             color = self.COLORS[level]
 
             if event_type == "cry_detected":
-                text = f"🚨 哭闹检测 (置信度: {event.get('confidence', 0):.2f})"
+                text = f"CRY Detected (conf: {event.get('confidence', 0):.2f})"
             elif event_type == "occlusion_detected":
-                text = f"🚨 口鼻遮挡 (置信度: {event.get('confidence', 0):.2f})"
+                text = f"OCCLUSION Detected (conf: {event.get('confidence', 0):.2f})"
             elif event_type == "limb_exposure":
-                text = f"⚠️  踢被子 (裸露比例: {event.get('ratio', 0):.2f})"
+                text = f"KICKED Blanket (ratio: {event.get('ratio', 0):.2f})"
             elif event_type == "region_exit":
-                text = f"⚠️  离开安全区域"
+                text = f"LEFT Safe Region"
             else:
-                text = f"事件: {event_type}"
+                text = f"Event: {event_type}"
 
             # 绘制半透明背景
             text_size = cv2.getTextSize(text, self.FONT, self.FONT_SCALE_SMALL, self.FONT_THICKNESS)[0]
@@ -251,13 +276,13 @@ class PreviewRenderer:
 
         h, w = frame.shape[:2]
         help_texts = [
-            "快捷键:",
-            "q: 退出程序",
-            "h: 显示/隐藏帮助",
-            "d: 显示/隐藏检测框",
-            "r: 显示/隐藏安全区域",
-            "s: 显示/隐藏统计信息",
-            "c: 校准安全区域"
+            "Shortcuts:",
+            "q: Quit",
+            "h: Toggle Help",
+            "d: Toggle Boxes",
+            "r: Toggle Region",
+            "s: Toggle Stats",
+            "c: Calibrate Region"
         ]
 
         y_offset = h - (len(help_texts) * 20) - 10

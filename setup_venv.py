@@ -45,7 +45,8 @@ def create_venv():
             return True
 
     print("\n正在创建 Python 虚拟环境...")
-    result = subprocess.run([PYTHON_BIN, "-m", "venv", VENV_DIR])
+    # 继承系统已经安装的包，避免重复安装MediaPipe等大依赖
+    result = subprocess.run([PYTHON_BIN, "-m", "venv", "--system-site-packages", VENV_DIR])
     if result.returncode != 0:
         print("虚拟环境创建失败")
         return False

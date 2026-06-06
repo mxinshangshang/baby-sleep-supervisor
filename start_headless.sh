@@ -1,5 +1,5 @@
 #!/bin/bash
-# 无头后台模式启动脚本
+# 无头后台模式启动脚本（和kid_supervisor完全一致）
 
 cd "$(dirname "$0")"
 
