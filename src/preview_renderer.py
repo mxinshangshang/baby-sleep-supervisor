@@ -33,6 +33,7 @@ class PreviewRenderer:
             "pose": (255, 255, 0),      # Cyan - Pose keypoints
             "torso": (255, 0, 255),     # Purple - Torso box
             "head": (0, 165, 255),      # Orange - Head box
+            "nearby": (0, 255, 255),    # Yellow - Nearby hand/object
         }
 
         # 字体设置
@@ -70,6 +71,25 @@ class PreviewRenderer:
             cv2.putText(frame, text, (x1, y1 - 10), self.FONT,
                         self.FONT_SCALE_SMALL, self.COLORS["face"], self.FONT_THICKNESS)
 
+        return frame
+
+    def draw_hand_detections(self, frame: np.ndarray, hands: List[Dict], occlusion: Optional[Dict] = None) -> np.ndarray:
+        """Draw hands/arms with risk semantics: nearby != airway occluder."""
+        if not self.show_detection_boxes or not hands:
+            return frame
+        risky_boxes = []
+        if occlusion:
+            for h in occlusion.get("features", {}).get("overlapping_hands", []) or []:
+                if h.get("bbox"):
+                    risky_boxes.append(tuple(h["bbox"]))
+        for hand in hands:
+            x1, y1, x2, y2 = hand["bbox"]
+            is_risky = any(abs(x1-r[0]) < 5 and abs(y1-r[1]) < 5 and abs(x2-r[2]) < 5 and abs(y2-r[3]) < 5 for r in risky_boxes)
+            color = self.COLORS["danger"] if is_risky else self.COLORS["nearby"]
+            label = "Airway occluder" if is_risky else "Hand nearby"
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, label, (x1, max(12, y1 - 8)), self.FONT,
+                        self.FONT_SCALE_SMALL, color, self.FONT_THICKNESS)
         return frame
 
     def draw_pose_landmarks(self, frame: np.ndarray, pose_data: Optional[Dict]) -> np.ndarray:
@@ -111,20 +131,76 @@ class PreviewRenderer:
         if "face_summary" in detections:
             face_summary = detections["face_summary"]
             face_mode = face_summary.get("mode", "not_visible")
-            face_text = "Mesh" if face_mode == "frontal_or_mesh" else "BBox side" if face_mode == "bbox_only_possible_side_face" else "Not visible"
+            face_text = (
+                "Mesh" if face_mode == "frontal_or_mesh"
+                else "BBox side" if face_mode == "bbox_only_possible_side_face"
+                else "Head/side visible" if face_mode == "pose_head_side_visible"
+                else "Not visible"
+            )
             face_count = face_summary.get("face_count", 0)
             face_conf = face_summary.get("main_face_confidence", 0.0)
+            face_pose = face_summary.get("pose", {}) or detections.get("face_orientation", {})
+            orientation = face_pose.get("orientation")
+            if orientation == "front":
+                face_text = "Front face mesh"
+            elif orientation == "slight_side":
+                face_text = f"Slight side mesh/{face_pose.get('direction', '?')}"
+            elif orientation == "side":
+                face_text = f"Side face mesh/{face_pose.get('direction', '?')}"
             cv2.putText(frame, f"Face: {face_text} n={face_count} c={face_conf:.2f}", (10, 50), self.FONT,
                         self.FONT_SCALE_NORMAL, self.COLORS["text"], self.FONT_THICKNESS)
+            if face_pose.get("available") and face_pose.get("yaw_ratio") is not None:
+                cv2.putText(frame, f"Face yaw: {face_pose.get('yaw_ratio'):.2f}", (10, 190), self.FONT,
+                            self.FONT_SCALE_SMALL, self.COLORS["text"], self.FONT_THICKNESS)
+
+        if "baby_topology" in detections:
+            topo = detections["baby_topology"]
+            topo_color = self.COLORS["normal"] if topo.get("topology_reliable") else self.COLORS["warning"]
+            cv2.putText(frame, f"Posture: {topo.get('posture','unknown')} topo={topo.get('axis_confidence',0):.2f}", (10, 230), self.FONT,
+                        self.FONT_SCALE_SMALL, topo_color, self.FONT_THICKNESS)
 
         # 绘制哭闹检测结果
+        if "face_absence" in detections:
+            absence = detections["face_absence"]
+            if absence.get("status") == "not_visible":
+                color = self.COLORS["warning"] if absence.get("duration_s", 0) < absence.get("threshold_s", 15) else self.COLORS["danger"]
+                cv2.putText(frame, f"Head/face hidden: {absence.get('duration_s', 0):.1f}s", (10, 170), self.FONT,
+                            self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
+
         if "cry" in detections:
             cry_data = detections["cry"]
             confidence = cry_data["confidence"]
             color = self.COLORS["danger"] if confidence > 0.7 else self.COLORS["warning"] if confidence > 0.5 else self.COLORS["normal"]
-            text = f"Cry: {confidence:.2f}" if cry_data.get("status") == "available" else "Cry: N/A"
+            if cry_data.get("status") == "available":
+                feats = cry_data.get("features", {})
+                rel = feats.get("cry_reliability", "")
+                mouth = feats.get("mouth_open_sustained", feats.get("mouth_open_score", 0.0))
+                text = f"Cry(fused): {confidence:.2f} {rel} M{mouth:.2f}"
+            elif cry_data.get("status") == "recent_hold":
+                age = cry_data.get("features", {}).get("recent_age_s", 0.0)
+                text = f"Cry(recent): {confidence:.2f} {age:.1f}s"
+            elif cry_data.get("status") == "suspected_no_mesh":
+                text = f"Cry(suspected): {confidence:.2f} no mesh"
+            elif cry_data.get("status") == "suspected_mouth_no_mesh":
+                mouth = cry_data.get("features", {}).get("mouth_open_sustained", cry_data.get("features", {}).get("mouth_open_score", 0.0))
+                text = f"Cry(mouth): {confidence:.2f} M{mouth:.2f}"
+            else:
+                text = "Cry: N/A (needs mesh/audio)"
             cv2.putText(frame, text, (10, 70), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
+
+        if "distress" in detections:
+            distress = detections["distress"]
+            dconf = distress.get("confidence", 0.0)
+            if dconf >= 0.35:
+                dcolor = self.COLORS["danger"] if dconf >= 0.7 else self.COLORS["warning"]
+                cv2.putText(frame, f"Distress: {dconf:.2f} {distress.get('features',{}).get('reason','')}", (10, 250), self.FONT,
+                            self.FONT_SCALE_SMALL, dcolor, self.FONT_THICKNESS)
+
+        if "motion" in detections:
+            motion = detections["motion"]
+            cv2.putText(frame, f"Motion: H{motion.get('head_motion', 0):.2f} L{motion.get('limb_motion', 0):.2f} A{motion.get('agitation', 0):.2f}", (10, 210), self.FONT,
+                        self.FONT_SCALE_SMALL, self.COLORS["text"], self.FONT_THICKNESS)
 
         # 绘制遮挡检测结果
         if "occlusion" in detections:
@@ -132,7 +208,11 @@ class PreviewRenderer:
             confidence = occlusion_data["confidence"]
             color = self.COLORS["danger"] if confidence > 0.6 else self.COLORS["warning"] if confidence > 0.3 else self.COLORS["normal"]
 
-            text = f"Occlusion: {confidence:.2f}" if occlusion_data.get("status") == "available" else "Occlusion: N/A"
+            if occlusion_data.get("status") in ("available", "fallback"):
+                label = "Occlusion" if occlusion_data.get("status") == "available" else "Occlusion(fallback)"
+                text = f"{label}: {confidence:.2f}"
+            else:
+                text = "Occlusion: N/A"
             cv2.putText(frame, text, (10, 90), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
 
@@ -145,14 +225,18 @@ class PreviewRenderer:
         if "limb_exposure" in detections:
             exposure_data = detections["limb_exposure"]
             ratio = exposure_data["ratio"]
-            color = self.COLORS["danger"] if ratio > 0.5 else self.COLORS["warning"] if ratio > 0.3 else self.COLORS["normal"]
+            features = exposure_data.get("features", {})
+            status = exposure_data.get("status")
+            level = features.get("coverage_level", "normal")
+            color = self.COLORS["warning"] if status in ("uncertain_topology", "nearby_external_hand") else self.COLORS["danger"] if level == "body_or_legs_exposed" else self.COLORS["warning"] if level == "limb_exposed" else self.COLORS["normal"]
 
-            text = f"Exposure: {ratio:.2f}" if exposure_data.get("status") == "available" else "Exposure: N/A"
+            status_note = " hand nearby" if status == "nearby_external_hand" else " uncertain" if status == "uncertain_topology" else ""
+            text = f"Coverage: {ratio:.2f} {level}{status_note}" if status != "unavailable" else "Coverage: N/A"
             cv2.putText(frame, text, (10, 110), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
 
             # 显示裸露肢体
-            exposed_limbs = exposure_data["features"].get("exposed_limbs", [])
+            exposed_limbs = features.get("exposed_limbs", [])
             if exposed_limbs:
                 limbs_text = f"Limbs: {', '.join(exposed_limbs)}"
                 cv2.putText(frame, limbs_text, (10, 130), self.FONT,
@@ -203,11 +287,13 @@ class PreviewRenderer:
         if status.get("has_cry", False):
             status_texts.append(("CRY", self.COLORS["danger"]))
         if status.get("has_exposure", False):
-            status_texts.append(("EXPOSURE", self.COLORS["warning"]))
+            status_texts.append(("COVERAGE", self.COLORS["warning"]))
         if status.get("has_occlusion", False):
             status_texts.append(("OCCLUSION", self.COLORS["danger"]))
         if status.get("has_region_exit", False):
             status_texts.append(("REGION EXIT", self.COLORS["warning"]))
+        if status.get("has_face_absence", False):
+            status_texts.append(("HEAD/FACE HIDDEN", self.COLORS["warning"]))
 
         if not status_texts:
             status_texts.append(("NORMAL", self.COLORS["normal"]))
@@ -252,6 +338,8 @@ class PreviewRenderer:
                 text = f"KICKED Blanket (ratio: {event.get('ratio', 0):.2f})"
             elif event_type == "region_exit":
                 text = f"LEFT Safe Region"
+            elif event_type == "face_not_visible":
+                text = f"HEAD/FACE Hidden ({event.get('duration_s', 0):.1f}s)"
             else:
                 text = f"Event: {event_type}"
 
@@ -304,6 +392,8 @@ class PreviewRenderer:
         detections = results.get("detections", {})
         if "faces" in detections:
             frame = self.draw_face_detections(frame, detections["faces"])
+        if "hands" in detections:
+            frame = self.draw_hand_detections(frame, detections["hands"], detections.get("occlusion"))
         if "pose" in detections and detections["pose"] and "pose_data" in results:
             frame = self.draw_pose_landmarks(frame, results["pose_data"])
 

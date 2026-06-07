@@ -19,8 +19,9 @@ inference:
   model_complexity: 1  # 模型复杂度: 0=快, 1=平衡, 2=准
   min_detection_confidence: 0.5
   min_tracking_confidence: 0.5
-  inference_fps: 8
-  display_fps: 10
+  # Heavy algorithm detection FPS. Preview FPS is configured separately under preview.
+  inference_fps: 3
+  display_fps: 10  # deprecated; use preview.display_fps
   enable_face_detection: true
   enable_pose_detection: true
 
@@ -30,11 +31,17 @@ detection:
   cry_confidence_threshold: 0.7  # 置信度阈值，超过则认为在哭闹
   cry_duration_threshold: 2.0    # 持续时间阈值，超过则触发告警
   cry_sensitivity: medium        # 灵敏度: low/medium/high
+  cry_hold_s: 8.0                # FaceMesh短暂丢失时保持最近哭闹状态
+  mouth_open_window_size: 6      # 嘴巴张开持续性窗口
+  mouth_variation_window_size: 6 # 嘴巴开合变化窗口
+  distress_confidence_threshold: 0.55
+  distress_duration_threshold: 1.5
+  distress_window_size: 6
 
   # 踢被子/肢体裸露检测
   limb_exposure_enabled: true
-  exposure_threshold: 0.3        # 裸露皮肤占身体比例阈值
-  exposure_duration_threshold: 5.0  # 持续时间阈值
+  exposure_threshold: 0.35       # 裸露/覆盖提示阈值；实际告警还会受拓扑和外部手臂过滤影响
+  exposure_duration_threshold: 15.0  # 持续时间阈值
 
   # 口鼻遮挡检测
   occlusion_detection_enabled: true
@@ -64,6 +71,9 @@ detection:
   region_exit_window_size: 8
   region_exit_confirm_ratio: 0.7
   alert_requires_confirmed_presence: true
+  face_absence_detection_enabled: true
+  face_absence_duration_threshold: 45.0
+  motion_window_size: 12
 
   # 呼吸检测（实验性功能）
   breath_detection_enabled: false
@@ -81,7 +91,7 @@ thermal:
   temp_warn_c: 65.0
   temp_throttle_c: 75.0
   temp_check_interval_s: 10.0
-  throttle_inference_fps: 5
+  throttle_inference_fps: 2
   throttle_model_complexity: 0
 
 process:
@@ -96,6 +106,7 @@ preview:
   show_detection_boxes: true
   show_safe_region: true
   show_statistics: true
+  display_fps: 15
 
 notification:
   console_enabled: true
@@ -107,7 +118,9 @@ notification:
   enabled_alert_types:
     - cry_detected
     - occlusion_detected
-    - limb_exposure
+    - face_not_visible
+    # Coverage/limb exposure is intentionally noisy in crib scenes; enable only if desired.
+    # - limb_exposure
     - region_exit
 
 storage:
