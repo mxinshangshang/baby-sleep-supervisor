@@ -28,6 +28,12 @@ class Notifier:
         self.feishu_secret = notify_cfg.get("feishu_secret", "")
         self.alert_level = notify_cfg.get("alert_level", "warning")
         self.alert_cooldown = notify_cfg.get("alert_cooldown_s", 60)
+        self.enabled_alert_types = set(notify_cfg.get("enabled_alert_types", [
+            "cry_detected",
+            "occlusion_detected",
+            "limb_exposure",
+            "region_exit",
+        ]))
 
         self.console_enabled = notify_cfg.get("console_enabled", True)
         self.capture_photo = notify_cfg.get("capture_photo_on_alert", True)
@@ -59,6 +65,9 @@ class Notifier:
 
     def _should_send_alert(self, event_type: str, level: str) -> bool:
         """检查是否应该发送告警"""
+        if event_type not in self.enabled_alert_types:
+            return False
+
         # 检查级别是否足够
         if self.level_priority[level] < self.level_priority[self.alert_level]:
             return False

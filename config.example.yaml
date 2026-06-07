@@ -104,6 +104,11 @@ notification:
   feishu_secret: ""  # 如果机器人设置了签名校验，填写这里
   capture_photo_on_alert: true
   alert_level: "warning"  # 发送通知的最低级别: notice/warning/danger
+  enabled_alert_types:
+    - cry_detected
+    - occlusion_detected
+    - limb_exposure
+    - region_exit
 
 storage:
   enabled: true

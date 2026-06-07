@@ -5,6 +5,11 @@
 """
 import sys
 import os
+import socket
+import struct
+import pickle
+import subprocess
+import time
 import cv2
 import numpy as np
 import yaml
@@ -12,8 +17,15 @@ import yaml
 # 添加src目录到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from src.config import BASE_DIR, CONFIG_PATH
-from picamera2 import Picamera2
+from src.config import CONFIG_PATH
+
+
+ALERT_OPTIONS = [
+    ("cry_detected", "Crying"),
+    ("occlusion_detected", "Face covered"),
+    ("limb_exposure", "Left hand exposed"),
+    ("region_exit", "Out of safe region"),
+]
 
 
 class RegionCalibrator:
@@ -32,11 +44,14 @@ class RegionCalibrator:
         existing_region = self.config["detection"].get("safe_region", [[50, 50], [590, 430]])
         print(f"Loaded existing safe_region with {len(existing_region)} points. Click 4 new corners to replace it.")
 
-        # 初始化摄像头
-        self.picam2 = None
+        self.client_socket = None
+        self.connection = None
+        self.camera_proc = None
+        network_cfg = self.config.get("network", {})
+        self.host = network_cfg.get("host", "127.0.0.1")
+        self.port = network_cfg.get("port", 65433)
         self.width = self.config["camera"].get("width", 640)
         self.height = self.config["camera"].get("height", 480)
-        self.fps = self.config["camera"].get("fps", 15)
 
     def mouse_callback(self, event, x, y, flags, param):
         """鼠标事件回调"""
@@ -102,23 +117,86 @@ class RegionCalibrator:
             cv2.imshow(self.window_name, self.temp_frame)
 
     def init_camera(self):
-        """初始化摄像头"""
-        print("正在初始化摄像头...")
+        """连接摄像头服务器，必要时自动启动"""
+        if self.connect_camera_server(timeout=1):
+            return True
+
+        print("未发现运行中的摄像头服务器，正在自动启动 camera_server.py...")
         try:
-            self.picam2 = Picamera2()
-            config = self.picam2.create_preview_configuration(
-                main={"size": (self.width, self.height), "format": "RGB888"},
-                controls={"FrameRate": self.fps}
-            )
-            self.picam2.configure(config)
-            self.picam2.start()
-            # 预热
-            import time
-            time.sleep(2)
-            print("摄像头初始化完成")
+            camera_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_server.py")
+            self.camera_proc = subprocess.Popen(["/usr/bin/python3", camera_script])
+        except Exception as e:
+            print(f"启动 camera_server.py 失败: {e}")
+            return False
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if self.camera_proc.poll() is not None:
+                print(f"camera_server.py 已退出，返回码: {self.camera_proc.returncode}")
+                return False
+            if self.connect_camera_server(timeout=1):
+                return True
+            time.sleep(0.5)
+
+        print("等待 camera_server.py 启动超时")
+        self.close_camera()
+        return False
+
+    def connect_camera_server(self, timeout=5):
+        print(f"正在连接摄像头服务器 {self.host}:{self.port}...")
+        try:
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.settimeout(timeout)
+            self.client_socket.connect((self.host, self.port))
+            self.connection = self.client_socket.makefile('rb')
+            print("摄像头服务器连接完成")
+            return True
+        except Exception:
+            self.close_connection()
+            return False
+
+    def read_frame(self):
+        size_data = self.connection.read(struct.calcsize('<L'))
+        if not size_data:
+            raise RuntimeError("摄像头服务器断开连接")
+
+        size = struct.unpack('<L', size_data)[0]
+        frame_data = self.connection.read(size)
+        if len(frame_data) != size:
+            raise RuntimeError("接收帧数据不完整")
+
+        encoded_frame = pickle.loads(frame_data)
+        frame = cv2.imdecode(encoded_frame, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise RuntimeError("帧解码失败")
+        return frame
+
+    def close_connection(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        if self.client_socket is not None:
+            self.client_socket.close()
+            self.client_socket = None
+
+    def close_camera(self):
+        self.close_connection()
+        if self.camera_proc is not None and self.camera_proc.poll() is None:
+            self.camera_proc.terminate()
+            try:
+                self.camera_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.camera_proc.kill()
+                self.camera_proc.wait()
+        self.camera_proc = None
+
+    def save_config(self):
+        try:
+            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                yaml.dump(self.config, f, default_flow_style=False, allow_unicode=True)
             return True
         except Exception as e:
-            print(f"摄像头初始化失败: {e}")
+            print(f"Failed to save config: {e}")
             return False
 
     def save_region(self):
@@ -127,18 +205,80 @@ class RegionCalibrator:
             print("Please select 4 corners before saving")
             return False
 
-        # 更新配置（保存为多边形顶点数组）
         self.config["detection"]["safe_region"] = [[int(p[0]), int(p[1])] for p in self.current_region]
 
-        try:
-            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                yaml.dump(self.config, f, default_flow_style=False, allow_unicode=True)
+        if self.save_config():
             print(f"Safe region saved to: {CONFIG_PATH}")
             print(f"New region: {len(self.current_region)} corners")
             return True
-        except Exception as e:
-            print(f"Failed to save config: {e}")
-            return False
+        return False
+
+    def notification_mouse_callback(self, event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        selected = param
+        for index, (event_type, _) in enumerate(ALERT_OPTIONS):
+            y1 = 93 + index * 45
+            if 40 <= x <= 560 and y1 <= y <= y1 + 35:
+                if event_type in selected:
+                    selected.remove(event_type)
+                else:
+                    selected.add(event_type)
+
+    def draw_notification_options(self, selected):
+        frame = np.full((360, 620, 3), 245, dtype=np.uint8)
+        cv2.putText(frame, "Select Feishu alert types", (35, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (30, 30, 30), 2)
+        cv2.putText(frame, "Click or press 1-4 to toggle, Enter/s to save", (35, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1)
+
+        for index, (event_type, label) in enumerate(ALERT_OPTIONS):
+            y = 115 + index * 45
+            checked = event_type in selected
+            cv2.rectangle(frame, (45, y - 22), (72, y + 5), (40, 40, 40), 2)
+            if checked:
+                cv2.line(frame, (51, y - 9), (59, y), (0, 140, 0), 3)
+                cv2.line(frame, (59, y), (70, y - 18), (0, 140, 0), 3)
+            cv2.putText(frame, f"{index + 1}. {label}", (90, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 30, 30), 2)
+
+        cv2.putText(frame, "a: select all   n: select none   q: skip", (35, 325),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+        return frame
+
+    def configure_notification_alerts(self):
+        notify_cfg = self.config.setdefault("notification", {})
+        default_enabled = [event_type for event_type, _ in ALERT_OPTIONS]
+        enabled = notify_cfg.get("enabled_alert_types", default_enabled)
+        selected = {event_type for event_type in enabled if event_type in default_enabled}
+
+        cv2.namedWindow("Notification Alerts", cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback("Notification Alerts", self.notification_mouse_callback, selected)
+
+        while True:
+            cv2.imshow("Notification Alerts", self.draw_notification_options(selected))
+            key = cv2.waitKey(50) & 0xFF
+
+            if key in (13, 10, ord('s')):
+                notify_cfg["enabled_alert_types"] = [event_type for event_type, _ in ALERT_OPTIONS if event_type in selected]
+                if self.save_config():
+                    print(f"Enabled Feishu alert types: {notify_cfg['enabled_alert_types']}")
+                cv2.destroyWindow("Notification Alerts")
+                return True
+            if key == ord('q'):
+                print("Skipped notification alert selection")
+                cv2.destroyWindow("Notification Alerts")
+                return False
+            if key == ord('a'):
+                selected.update(default_enabled)
+            elif key == ord('n'):
+                selected.clear()
+            elif ord('1') <= key <= ord(str(len(ALERT_OPTIONS))):
+                event_type = ALERT_OPTIONS[key - ord('1')][0]
+                if event_type in selected:
+                    selected.remove(event_type)
+                else:
+                    selected.add(event_type)
 
     def run(self):
         """运行校准工具"""
@@ -155,9 +295,10 @@ class RegionCalibrator:
             return 1
 
         try:
-            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-            self.frame = self.picam2.capture_array()
-            self.frame = cv2.cvtColor(self.frame, cv2.COLOR_RGB2BGR)
+            cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+            self.frame = self.read_frame()
+            self.height, self.width = self.frame.shape[:2]
+            print(f"Calibration frame size: {self.width}x{self.height}")
             self._draw_polygon()
             cv2.imshow(self.window_name, self.temp_frame)
             cv2.waitKey(100)
@@ -165,13 +306,12 @@ class RegionCalibrator:
         except Exception as e:
             print(f"Failed to create preview window: {e}")
             print("Please run this tool from the Raspberry Pi desktop session, not a headless SSH shell.")
-            self.picam2.stop()
+            self.close_camera()
             return 1
 
         try:
             while True:
-                self.frame = self.picam2.capture_array()
-                self.frame = cv2.cvtColor(self.frame, cv2.COLOR_RGB2BGR)
+                self.frame = self.read_frame()
                 self._draw_polygon()
 
                 if not self.is_completed:
@@ -203,6 +343,7 @@ class RegionCalibrator:
                 elif key == ord('s'):
                     if self.save_region():
                         print("Calibration saved")
+                        self.configure_notification_alerts()
                         break
                 elif key == ord('r'):
                     self.points = []
@@ -215,7 +356,7 @@ class RegionCalibrator:
                         print(f"Undo point: {removed}, remaining {len(self.points)}")
 
         finally:
-            self.picam2.stop()
+            self.close_camera()
             cv2.destroyAllWindows()
 
         return 0

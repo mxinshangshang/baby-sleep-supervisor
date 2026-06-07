@@ -114,11 +114,13 @@ cd /home/mxin/.openclaw/workspace/baby_sleep_supervisor
 ```
 
 步骤：
-1. 启动后默认不显示旧区域，直接等待新的四点输入
-2. 依次左键点击婴儿床四个角点，第四个点后自动闭合并锁定区域
-3. 如果想重画，继续点击第五个点会清空前四点并开始新一轮四点输入
-4. 右键或 `u` 撤销未完成的上一个点，`r` 重置全部点
-5. 按 `s` 保存配置，配置自动写回 `config.yaml`
+1. 标定工具会复用 `camera_server.py` 的同源画面；如果没有运行中的摄像头服务，会自动用 `/usr/bin/python3` 启动一个临时服务
+2. 启动后默认不显示旧区域，直接等待新的四点输入
+3. 依次左键点击婴儿床四个角点，第四个点后自动闭合并锁定区域
+4. 如果想重画，继续点击第五个点会清空前四点并开始新一轮四点输入
+5. 右键或 `u` 撤销未完成的上一个点，`r` 重置全部点
+6. 按 `s` 保存安全区域，配置自动写回 `config.yaml`
+7. 保存后在英文通知项选择框里勾选需要发送飞书通知的告警类型，按 `Enter`/`s` 保存到 `notification.enabled_alert_types`
 
 ---
 
@@ -381,6 +383,11 @@ notification:
   feishu_enabled: true
   feishu_webhook: "your-webhook-url"  # OpenClaw 通道不可用时的回退 webhook
   capture_photo_on_alert: true
+  enabled_alert_types:
+    - cry_detected          # Crying
+    - occlusion_detected    # Face covered
+    - limb_exposure         # Left hand exposed
+    - region_exit           # Out of safe region
 
 supervision:
   alert_cooldown_s: 60.0

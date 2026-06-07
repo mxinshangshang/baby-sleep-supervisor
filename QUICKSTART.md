@@ -40,11 +40,13 @@ notification:
 ```bash
 /usr/bin/python3 calibrate_region.py
 ```
+- 标定工具复用 `camera_server.py` 的同源画面；没有运行中的摄像头服务时会自动启动临时服务
 - 启动后默认不显示旧区域，直接等待新区域输入
 - 左键依次点击四个角点，第四个点后自动闭合区域
 - 第五次点击会清空旧四点并重新开始
 - 右键或 `u` 撤销未完成的上一个点
 - `r` 重置，`s` 保存，`q` 不保存退出
+- 保存安全区域后会弹出英文飞书通知项选择框，可勾选 `Crying`、`Face covered`、`Left hand exposed`、`Out of safe region`；使用鼠标或数字键切换，`Enter`/`s` 保存
 
 ## 3. 启动系统
 
