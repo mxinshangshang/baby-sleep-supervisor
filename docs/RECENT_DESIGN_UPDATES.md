@@ -199,15 +199,25 @@ FaceMesh available:
 
 - `mouth_aspect_ratio`
 - `mouth_open_score`
-- sustained mouth openness
+- sustained mouth openness (`M`)
 - mouth opening variation across frames
+- mouth open/close rhythm and pulse rate (`R`)
 - face orientation/yaw
-- head/limb agitation
+- head swing / head motion (`H`)
+- limb agitation (`L`)
+- motion burst score
 
 FaceMesh unavailable:
 
 - `detect_mouth_open_fallback()` searches the lower-central head ROI for a dark open-mouth-like candidate.
 - This fallback is conservative and feeds suspected crying/distress, not a definitive audio cry.
+
+Temporal cry analyzer:
+
+- Crying is treated as a short time-window pattern rather than a single-frame expression.
+- Static open mouth with little head/limb motion is capped to avoid sleep/open-mouth breathing false positives.
+- Strong visual crying requires rhythmic mouth opening plus supporting head swing, limb agitation, or motion burst.
+- Weak evidence is allowed in the overlay for debugging but is not allowed to trigger notifications.
 
 State holding:
 
@@ -225,12 +235,25 @@ Distress fallback:
 UI examples:
 
 ```text
-Cry(fused): 0.61 high M0.78
+Cry: 0.42 high M0.70 R0.12 H0.04 L0.08
 Cry(recent): 0.75 3.2s
 Cry(suspected): 0.58 no mesh
 Cry(mouth): 0.65 M0.62
-Distress: 0.72 airway_or_face_hidden_with_motion
+Distress: 0.49 weak_distress_evidence
 ```
+
+Overlay abbreviations:
+
+- `M`: sustained mouth opening.
+- `R`: mouth open/close rhythm.
+- `H`: head swing / head motion.
+- `L`: limb agitation.
+
+Notification rules after the sensitivity tuning:
+
+- `weak_distress_evidence` is overlay-only and does not send notifications.
+- Notification-level distress requires `visual_cry`, `airway_or_face_hidden_with_motion`, or `airway_risk_cry_unreadable`.
+- Default `distress_confidence_threshold` is now `0.70`.
 
 Important limitation: without a microphone, this is still **visual suspected crying/distress**, not definitive acoustic crying. A future audio cry model should be treated as the primary crying evidence.
 
@@ -244,7 +267,8 @@ Current alert types are focused on:
 
 Recent behavior changes:
 
-- Cry/distress can now produce `cry_detected` events when visual evidence is strong.
+- Cry/distress can now produce `cry_detected` events when temporal visual evidence is strong.
+- Weak visual distress remains visible in the overlay but does not send Feishu/GitHub notifications.
 - Occlusion is still danger-level when airway ROI is blocked.
 - Coverage/limb exposure is intentionally conservative to reduce noise.
 
@@ -252,7 +276,7 @@ Recent behavior changes:
 
 - MediaPipe models are not trained specifically for newborn/infant crib top-view scenes.
 - Visual crying can still miss crying when the mouth is fully hidden and there is little motion.
-- Visual crying can still false-positive on yawning/open-mouth if no audio model is present.
+- Visual crying can still false-positive on yawning/open-mouth if no audio model is present, though static open-mouth cases are now capped unless mouth rhythm or body motion supports crying.
 - Hands/FaceMesh together are CPU-heavy on Raspberry Pi; current inference FPS is reduced for thermal safety.
 - True sleep-safety semantics still need explicit soft-object/blanket/edge region modeling.
 
@@ -271,3 +295,4 @@ Recent behavior changes:
    - `mouthFrown`.
 4. Cache successful FaceMesh ROI angle/scale to reduce CPU.
 5. Add result age to the overlay so cached detection boxes are visually distinguishable from the live camera frame.
+6. Validate the temporal cry analyzer in daylight against real crying, yawning, open-mouth sleep, and normal limb movement clips.
