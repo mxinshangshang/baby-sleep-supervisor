@@ -175,7 +175,10 @@ class PreviewRenderer:
                 feats = cry_data.get("features", {})
                 rel = feats.get("cry_reliability", "")
                 mouth = feats.get("mouth_open_sustained", feats.get("mouth_open_score", 0.0))
-                text = f"Cry(fused): {confidence:.2f} {rel} M{mouth:.2f}"
+                rhythm = feats.get("mouth_rhythm_score", 0.0)
+                head = feats.get("head_swing_score", 0.0)
+                limb = feats.get("limb_agitation_score", 0.0)
+                text = f"Cry: {confidence:.2f} {rel} M{mouth:.2f} R{rhythm:.2f} H{head:.2f} L{limb:.2f}"
             elif cry_data.get("status") == "recent_hold":
                 age = cry_data.get("features", {}).get("recent_age_s", 0.0)
                 text = f"Cry(recent): {confidence:.2f} {age:.1f}s"

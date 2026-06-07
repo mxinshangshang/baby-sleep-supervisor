@@ -34,7 +34,7 @@ detection:
   cry_hold_s: 8.0                # FaceMesh短暂丢失时保持最近哭闹状态
   mouth_open_window_size: 6      # 嘴巴张开持续性窗口
   mouth_variation_window_size: 6 # 嘴巴开合变化窗口
-  distress_confidence_threshold: 0.55
+  distress_confidence_threshold: 0.70
   distress_duration_threshold: 1.5
   distress_window_size: 6
 

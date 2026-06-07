@@ -81,7 +81,7 @@ class SleepSupervisor:
         self.last_cry_time: float = 0.0
         self.cry_hold_s: float = detection_cfg.get("cry_hold_s", 8.0)
         self.distress_start_time: Optional[float] = None
-        self.distress_threshold = detection_cfg.get("distress_confidence_threshold", 0.55)
+        self.distress_threshold = detection_cfg.get("distress_confidence_threshold", 0.70)
         self.distress_duration_threshold = detection_cfg.get("distress_duration_threshold", 1.5)
 
         # 平滑窗口
@@ -96,6 +96,9 @@ class SleepSupervisor:
         self.distress_window = deque(maxlen=detection_cfg.get("distress_window_size", 6))
         self.prev_mouth_open_score: Optional[float] = None
         self.mouth_variation_window = deque(maxlen=detection_cfg.get("mouth_variation_window_size", 6))
+        self.cry_temporal_window = deque(maxlen=detection_cfg.get("cry_temporal_window_size", 10))
+        self.mouth_pulse_window = deque(maxlen=detection_cfg.get("mouth_pulse_window_size", 10))
+        self.prev_mouth_trend: Optional[int] = None
         self.prev_motion_points: Optional[Dict] = None
         self.last_confirmed_presence_time = 0.0
 
@@ -455,6 +458,13 @@ class SleepSupervisor:
         }
 
     def _combine_cry_evidence(self, expression_confidence: float, cry_features: Dict, face_pose: Dict, motion_features: Dict) -> Tuple[float, Dict]:
+        """Fuse visual cry evidence using temporal baby-cry features.
+
+        Key idea: crying is usually a short temporal pattern, not a single-frame expression.
+        - mouth rhythm/open-close variation is the primary visual cue;
+        - head swing and limb agitation are supporting cues;
+        - static open mouth with low motion is capped to avoid sleep/open-mouth breathing false positives.
+        """
         orientation = face_pose.get("orientation") if face_pose else None
         yaw = face_pose.get("yaw_ratio") if face_pose else None
         abs_yaw = abs(float(yaw)) if yaw is not None else 1.0
@@ -463,33 +473,81 @@ class SleepSupervisor:
         limb_motion = float(motion_features.get("limb_motion", 0.0))
         mouth_open_score = float(cry_features.get("mouth_open_score", 0.0))
         mouth_aspect_ratio = float(cry_features.get("mouth_aspect_ratio", 0.0))
+
+        # Mouth temporal features.
         self.mouth_open_window.append(mouth_open_score)
+        mouth_delta = 0.0
         if self.prev_mouth_open_score is not None:
-            self.mouth_variation_window.append(abs(mouth_open_score - self.prev_mouth_open_score))
+            mouth_delta = abs(mouth_open_score - self.prev_mouth_open_score)
+            self.mouth_variation_window.append(mouth_delta)
+            trend = 1 if mouth_open_score - self.prev_mouth_open_score > 0.04 else -1 if self.prev_mouth_open_score - mouth_open_score > 0.04 else 0
+            if trend and self.prev_mouth_trend and trend != self.prev_mouth_trend:
+                self.mouth_pulse_window.append(1.0)
+            else:
+                self.mouth_pulse_window.append(0.0)
+            if trend:
+                self.prev_mouth_trend = trend
         self.prev_mouth_open_score = mouth_open_score
+
         mouth_open_sustained = float(sum(self.mouth_open_window) / len(self.mouth_open_window)) if self.mouth_open_window else 0.0
         mouth_variation = float(sum(self.mouth_variation_window) / len(self.mouth_variation_window)) if self.mouth_variation_window else 0.0
+        mouth_pulse_rate = float(sum(self.mouth_pulse_window) / len(self.mouth_pulse_window)) if self.mouth_pulse_window else 0.0
 
+        mouth_static_open_score = max(0.0, min(1.0, (mouth_open_sustained - 0.45) / 0.35))
+        mouth_rhythm_score = max(
+            0.0,
+            min(1.0, 0.65 * min(1.0, mouth_variation * 4.0) + 0.35 * min(1.0, mouth_pulse_rate * 3.0))
+        )
+        head_swing_score = max(0.0, min(1.0, head_motion * 5.0))
+        limb_agitation_score = max(0.0, min(1.0, limb_motion * 3.2))
+        motion_burst_score = max(0.0, min(1.0, agitation * 3.0))
+
+        # Expression reliability by view angle.
         if orientation == "front" and abs_yaw < 0.18:
             reliability = "high"
-            combined = 0.65 * expression_confidence + 0.25 * mouth_open_sustained + 0.10 * agitation
+            expression_weight = 0.25
         elif orientation in ("front", "slight_side", "side") and abs_yaw < 0.65:
-            # Side/crib view: do not ignore crying. A clearly open mouth sustained across frames
-            # is meaningful, especially with any head/body agitation. Cap only when mouth is weak.
             reliability = "medium" if abs_yaw < 0.42 else "side_visual"
-            combined = 0.42 * mouth_open_sustained + 0.28 * expression_confidence + 0.20 * agitation + 0.10 * min(1.0, mouth_variation * 3.0)
-            if mouth_open_sustained >= 0.62 and mouth_aspect_ratio >= 0.42:
-                combined = max(combined, 0.70 + min(0.15, agitation * 0.25))
-            elif mouth_open_sustained >= 0.50 and (agitation >= 0.08 or head_motion >= 0.04 or limb_motion >= 0.04):
-                combined = max(combined, 0.62)
-            else:
-                combined = min(combined, 0.58)
+            expression_weight = 0.18
         else:
             reliability = "low"
-            combined = 0.45 * mouth_open_sustained + 0.35 * agitation + 0.20 * min(expression_confidence, 0.45)
-            combined = min(combined, 0.62)
+            expression_weight = 0.10
 
-        return min(1.0, float(combined)), {
+        cry_temporal_score = (
+            0.38 * mouth_rhythm_score
+            + 0.22 * mouth_static_open_score
+            + 0.16 * head_swing_score
+            + 0.16 * limb_agitation_score
+            + 0.08 * motion_burst_score
+        )
+        combined = cry_temporal_score * (1.0 - expression_weight) + expression_confidence * expression_weight
+
+        # Strong cry pattern: rhythmic mouth + supporting motion.
+        strong_temporal_cry = (
+            mouth_rhythm_score >= 0.45
+            and mouth_open_sustained >= 0.58
+            and (head_swing_score >= 0.18 or limb_agitation_score >= 0.22 or motion_burst_score >= 0.20)
+        )
+        # Static mouth open without motion is common during sleep/yawning; cap it.
+        static_open_no_motion = (
+            mouth_static_open_score >= 0.45
+            and mouth_rhythm_score < 0.22
+            and head_swing_score < 0.16
+            and limb_agitation_score < 0.18
+        )
+
+        if strong_temporal_cry:
+            combined = max(combined, 0.70 + min(0.12, motion_burst_score * 0.08 + mouth_rhythm_score * 0.08))
+        elif static_open_no_motion:
+            combined = min(combined, 0.52)
+        else:
+            # Moderate evidence should stay visible but generally below notification threshold.
+            combined = min(combined, 0.64)
+
+        self.cry_temporal_window.append(combined)
+        smoothed_temporal = float(sum(self.cry_temporal_window) / len(self.cry_temporal_window)) if self.cry_temporal_window else combined
+
+        return min(1.0, float(smoothed_temporal)), {
             "face_orientation": orientation,
             "yaw_ratio": yaw,
             "motion_agitation": agitation,
@@ -498,9 +556,18 @@ class SleepSupervisor:
             "mouth_open_score": mouth_open_score,
             "mouth_open_sustained": mouth_open_sustained,
             "mouth_open_variation": mouth_variation,
+            "mouth_pulse_rate": mouth_pulse_rate,
+            "mouth_static_open_score": mouth_static_open_score,
+            "mouth_rhythm_score": mouth_rhythm_score,
+            "head_swing_score": head_swing_score,
+            "limb_agitation_score": limb_agitation_score,
+            "motion_burst_score": motion_burst_score,
+            "cry_temporal_score": cry_temporal_score,
             "mouth_aspect_ratio": mouth_aspect_ratio,
             "expression_confidence_raw": float(expression_confidence),
             "cry_reliability": reliability,
+            "strong_temporal_cry": strong_temporal_cry,
+            "static_open_no_motion": static_open_no_motion,
         }
 
     def _compute_distress_evidence(self, presence: Dict, face_summary: Dict, cry_data: Dict, motion_features: Dict, occlusion_data: Optional[Dict]) -> Tuple[float, Dict]:
@@ -521,31 +588,35 @@ class SleepSupervisor:
         face_landmarks = bool(face_summary.get("landmarks_available"))
         face_available = bool(face_summary.get("available"))
 
-        hidden_or_risky = (not face_landmarks and face_available) or occlusion_conf >= 0.45
+        hidden_or_risky = (not face_landmarks and face_available) or occlusion_conf >= 0.55
         airway_high_risk = occlusion_conf >= self.occlusion_threshold
-        motion_distress = agitation >= 0.035 or head_motion >= 0.025 or limb_motion >= 0.045
+        motion_distress = agitation >= 0.12 or head_motion >= 0.08 or limb_motion >= 0.14
         score = cry_conf
         if airway_high_risk and not face_landmarks:
-            # In real baby monitoring, airway/face risk + unavailable mesh should not only notify
-            # as occlusion. It is also suspected distress/cry because visual cry cannot be read.
-            score = max(score, 0.68 + min(0.15, occlusion_conf * 0.15))
-        elif hidden_or_risky:
-            score = max(score, 0.45 + min(0.22, occlusion_conf * 0.30))
-        if motion_distress:
-            score += min(0.24, agitation * 1.6 + head_motion * 0.8 + limb_motion * 0.6)
-        if cry_status in ("recent_hold", "suspected_no_mesh"):
+            # Airway/face risk + unavailable mesh may indicate distress, but do not let weak
+            # visual evidence repeatedly spam cry notifications without motion or strong risk.
+            score = max(score, 0.64 + min(0.12, occlusion_conf * 0.12))
+        elif hidden_or_risky and motion_distress:
+            score = max(score, 0.45 + min(0.18, occlusion_conf * 0.25))
+        if hidden_or_risky and motion_distress:
+            score += min(0.20, agitation * 1.2 + head_motion * 0.5 + limb_motion * 0.4)
+        elif not hidden_or_risky and motion_distress and cry_conf >= 0.62:
+            score += min(0.10, agitation * 0.4 + limb_motion * 0.2)
+        if cry_status in ("recent_hold", "suspected_no_mesh", "suspected_mouth_no_mesh"):
             score = max(score, cry_conf)
         score = min(1.0, score)
         self.distress_window.append(score)
         smoothed = float(sum(self.distress_window) / len(self.distress_window)) if self.distress_window else score
         if cry_conf >= self.cry_threshold:
             reason = "visual_cry"
-        elif airway_high_risk and not face_landmarks:
+        elif airway_high_risk and not face_landmarks and motion_distress:
             reason = "airway_risk_cry_unreadable"
         elif hidden_or_risky and motion_distress:
             reason = "airway_or_face_hidden_with_motion"
         else:
             reason = "weak_distress_evidence"
+            score = min(score, 0.49)
+            smoothed = min(smoothed, 0.49)
         return smoothed, {
             "reason": reason,
             "cry_status": cry_status,
@@ -741,8 +812,8 @@ class SleepSupervisor:
                     self.prev_mouth_open_score = fallback_mouth_score
                 fallback_mouth_sustained = float(sum(self.mouth_open_window) / len(self.mouth_open_window)) if self.mouth_open_window else fallback_mouth_score
                 recent_age = now - self.last_cry_time if self.last_cry_time else 999.0
-                if presence["confirmed"] and fallback_mouth_sustained >= 0.50:
-                    suspected = min(0.72, 0.45 + fallback_mouth_sustained * 0.35 + motion_features.get("agitation", 0.0) * 0.4)
+                if presence["confirmed"] and fallback_mouth_sustained >= 0.65 and (motion_features.get("agitation", 0.0) >= 0.08 or motion_features.get("head_motion", 0.0) >= 0.06 or motion_features.get("limb_motion", 0.0) >= 0.10):
+                    suspected = min(0.72, 0.40 + fallback_mouth_sustained * 0.32 + motion_features.get("agitation", 0.0) * 0.35)
                     results["detections"]["cry"] = {
                         "confidence": suspected,
                         "status": "suspected_mouth_no_mesh",
@@ -873,7 +944,9 @@ class SleepSupervisor:
                 "status": "available" if presence.get("confirmed") else "unavailable",
                 "features": distress_features,
             }
-            if distress_conf >= self.distress_threshold:
+            distress_reason = distress_features.get("reason")
+            notifyable_distress = distress_reason in ("visual_cry", "airway_or_face_hidden_with_motion", "airway_risk_cry_unreadable")
+            if notifyable_distress and distress_conf >= self.distress_threshold:
                 if self.distress_start_time is None:
                     self.distress_start_time = now
                 elif now - self.distress_start_time >= self.distress_duration_threshold and self._should_alert("cry_detected"):
