@@ -40,8 +40,10 @@ def read_cpu_temp_c():
 class LatestFrameReceiver:
     """Continuously drains the camera TCP stream and keeps only the latest decoded frame."""
 
-    def __init__(self, connection):
+    def __init__(self, connection, frame_width: int, frame_height: int):
         self.connection = connection
+        self.frame_width = frame_width
+        self.frame_height = frame_height
         self.lock = threading.Lock()
         self.latest_frame = None
         self.latest_seq = 0
@@ -73,12 +75,19 @@ class LatestFrameReceiver:
                 frame_data = self.connection.read(size)
                 if len(frame_data) != size:
                     raise ConnectionError("接收帧数据不完整")
-                encoded_frame = pickle.loads(frame_data)
-                frame = cv2.imdecode(encoded_frame, cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
+
+                # 优化点：直接接收原始 YUV420 数据，跳过 JPEG 解码
+                # YUV420 数据结构：Y(W*H) + U(W/2*H/2) + V(W/2*H/2)
+                frame_yuv = np.frombuffer(frame_data, dtype=np.uint8)
+
+                # 重构 YUV420 数组形状 (H*3//2, W)
+                frame_yuv_reshaped = frame_yuv.reshape((self.frame_height * 3 // 2, self.frame_width))
+
+                # 转换为 BGR（只做一次，用于预览和检测）
+                frame_bgr = cv2.cvtColor(frame_yuv_reshaped, cv2.COLOR_YUV2BGR_I420)
+
                 with self.lock:
-                    self.latest_frame = frame
+                    self.latest_frame = frame_bgr
                     self.latest_seq += 1
                     self.latest_time = time.time()
         except BaseException as e:
@@ -187,6 +196,10 @@ def main():
     host = network_cfg.get("host", "127.0.0.1")
     port = network_cfg.get("port", 65433)
 
+    camera_cfg = config.get("camera", {})
+    frame_width = camera_cfg.get("width", 1536)
+    frame_height = camera_cfg.get("height", 864)
+
     inference_cfg = config.get("inference", {})
     preview_cfg = config.get("preview", {})
     thermal_cfg = config.get("thermal", {})
@@ -273,7 +286,7 @@ def main():
                         client_socket.connect((host, port))
                         client_socket.settimeout(None)
                         connection = client_socket.makefile('rb')
-                        receiver = LatestFrameReceiver(connection)
+                        receiver = LatestFrameReceiver(connection, frame_width, frame_height)
                         receiver.start()
                         inference_worker = LatestInferenceWorker(
                             supervisor, receiver, normal_inference_fps, throttle_inference_fps,
