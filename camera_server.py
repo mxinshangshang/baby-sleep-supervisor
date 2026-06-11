@@ -29,10 +29,10 @@ with open(os.path.join(BASE_DIR, "config.yaml"), 'r', encoding='utf-8') as f:
 CAMERA_CFG = CONFIG["camera"]
 NETWORK_CFG = CONFIG["network"]
 
-WIDTH = CAMERA_CFG.get("width", 1536)
-HEIGHT = CAMERA_CFG.get("height", 864)
+WIDTH = CAMERA_CFG.get("width", 960)
+HEIGHT = CAMERA_CFG.get("height", 540)
 FPS = CAMERA_CFG.get("fps", 15)
-FORMAT = CAMERA_CFG.get("format", "YUV420")
+FORMAT = "RGB888"  # picamera2 原生格式，客户端转 BGR
 USE_FULL_SENSOR_FOV = CAMERA_CFG.get("use_full_sensor_fov", True)
 
 HOST = NETWORK_CFG.get("host", "127.0.0.1")
@@ -44,23 +44,24 @@ YUV_FRAME_SIZE = WIDTH * HEIGHT * 3 // 2
 
 def init_camera():
     """初始化摄像头
-    优化点：使用完整传感器 FOV，避免中心裁剪导致广角丢失
+    优化点：强制使用完整传感器 FOV，避免中心裁剪导致广角丢失
     """
     print(f"[Camera] 初始化摄像头 {WIDTH}x{HEIGHT} @ {FPS}fps, format={FORMAT}")
     if USE_FULL_SENSOR_FOV:
-        print(f"[Camera] 启用完整传感器 FOV 模式（广角最大化）")
+        print(f"[Camera] 强制使用完整传感器阵列（广角最大化）")
 
     picam2 = Picamera2()
 
     if USE_FULL_SENSOR_FOV:
-        # 关键：使用 video_configuration 会自动使用完整传感器区域下采样
-        # 而不是 preview_configuration 的中心裁剪模式
+        # 关键：指定 sensor 的输出大小，强制 ISP 使用完整传感器阵列下采样
+        # Camera Module 3 原生传感器是 4608x2592
         config = picam2.create_video_configuration(
             main={"size": (WIDTH, HEIGHT), "format": FORMAT},
+            raw={"size": (4608, 2592)},  # 强制使用完整传感器阵列
             controls={"FrameRate": FPS}
         )
     else:
-        # 传统预览模式（中心裁剪，会损失广角）
+        # 传统模式（可能中心裁剪，会损失广角）
         config = picam2.create_preview_configuration(
             main={"size": (WIDTH, HEIGHT), "format": FORMAT},
             controls={"FrameRate": FPS}
@@ -72,8 +73,10 @@ def init_camera():
     # 预热
     time.sleep(2)
     actual_config = picam2.camera_configuration()
-    print(f"[Camera] 实际配置: size={actual_config['main']['size']}, "
-          f"format={actual_config['main']['format']}")
+    print(f"[Camera] 实际配置: ")
+    print(f"  输出尺寸: {actual_config['main']['size']}")
+    print(f"  传感器阵列: {actual_config.get('raw', {}).get('size', 'N/A')}")
+    print(f"  像素格式: {actual_config['main']['format']}")
     print("[Camera] 摄像头初始化完成")
     return picam2
 
@@ -123,17 +126,14 @@ def main():
 
                 try:
                     while running:
-                        # 优化点：零拷贝采集，直接使用 request 缓冲区
-                        # 避免 capture_array() 的内存拷贝
-                        request = picam2.capture_request()
-                        frame = request.make_array("main")
-                        request.release()
+                        # capture_array() 返回的就是 OpenCV 原生 BGR 格式
+                        # 和原始版本保持一致，确保颜色顺序正确
+                        frame = picam2.capture_array()
 
-                        # 优化点：直接发送原始 YUV 数据，跳过 JPEG 编解码
-                        # YUV420 已经是连续内存，直接发送
+                        # 直接发送原始 BGR 数据，跳过 JPEG 编解码
                         frame_data = frame.tobytes()
 
-                        # 发送帧大小和数据（兼容旧协议，但现在是固定大小）
+                        # 发送帧大小和数据
                         client_socket.sendall(struct.pack("<L", len(frame_data)))
                         client_socket.sendall(frame_data)
 

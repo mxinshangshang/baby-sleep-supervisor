@@ -411,15 +411,22 @@ class PreviewRenderer:
 
         # 绘制检测框
         detections = results.get("detections", {})
-        if "faces" in detections:
+        result_age_s = float(results.get("result_age_s", 0.0))
+        detections_fresh = result_age_s <= 2.0
+        if not detections_fresh:
+            cv2.putText(frame, f"Detection stale: {result_age_s:.1f}s", (10, 290), self.FONT,
+                        self.FONT_SCALE_NORMAL, self.COLORS["warning"], self.FONT_THICKNESS)
+
+        if detections_fresh and "faces" in detections:
             frame = self.draw_face_detections(frame, detections["faces"])
-        if "hands" in detections:
+        if detections_fresh and "hands" in detections:
             frame = self.draw_hand_detections(frame, detections["hands"], detections.get("occlusion"))
-        if "pose" in detections and detections["pose"] and "pose_data" in results:
+        if detections_fresh and "pose" in detections and detections["pose"] and "pose_data" in results:
             frame = self.draw_pose_landmarks(frame, results["pose_data"])
 
-        # 绘制检测结果文字
-        frame = self.draw_detection_results(frame, results)
+        # 绘制检测结果文字。结果过期时不继续显示旧 Region/Pose 状态，避免误导。
+        if detections_fresh:
+            frame = self.draw_detection_results(frame, results)
 
         # 绘制状态栏
         frame = self.draw_status_bar(frame, status)

@@ -418,7 +418,7 @@ def multimodal_fusion(
         fused = max(fused, audio_conf * 0.95)
 
     # 冲突抑制：音频强但视觉完全否定
-    if audio_conf >= 0.6 and visual_conf < 0.1:
+    if audio_conf >= 0.6 and visual_confidence < 0.1:
         fused = fused * 0.6  # 降级处理
 
     # 确定置信等级

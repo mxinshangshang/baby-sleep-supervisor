@@ -89,11 +89,13 @@ def main():
     camera_state = ProcessState(name="camera")
     inference_state = ProcessState(name="inference")
     running = True
+    shutting_down = False  # 主动关闭标志：True时子进程退出不再重启
     last_status_log = 0.0
 
     def cleanup(signum=None, frame=None):
-        nonlocal running
+        nonlocal running, shutting_down
         running = False
+        shutting_down = True  # 设置主动关闭标志，防止看门狗误重启
         print("\n[Main] 正在安全退出，释放所有资源...")
         # 先终止推理进程
         if inference_state.proc and inference_state.proc.poll() is None:
@@ -154,6 +156,10 @@ def main():
         state.last_exit_code = state.proc.returncode if state.proc else None
         state.restart_count += 1
         print(f"[Main] {state.name} 退出 (code: {state.last_exit_code})")
+
+        # 主动关闭时不再重启
+        if shutting_down:
+            return None
 
         if state.restart_count <= MAX_RESTART:
             backoff = min(RESTART_BACKOFF_BASE * state.restart_count, 10)

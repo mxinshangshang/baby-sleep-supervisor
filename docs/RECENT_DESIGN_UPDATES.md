@@ -10,6 +10,8 @@ This document summarizes the latest engineering changes to the baby sleep monito
 - Reduce false positives from adult hands/arms and blanket texture.
 - Make crying/distress detection pay more attention to mouth opening and mouth motion.
 - Add a baby-centric topology layer to reduce head/leg confusion in crib views.
+- Handle inference worker crashes gracefully with auto-restart and stale-result clearing.
+- Show detection staleness in preview so viewers are never misled by cached results.
 
 ## Runtime Pipeline
 
@@ -34,6 +36,8 @@ The inference client received frames and ran heavy detection in the same loop. W
 3. Main preview loop
    - Renders the latest camera frame using cached/latest detection results.
    - Does not block on heavy inference.
+   - Hides detection boxes/text when results are stale (>2s old) and shows a warning.
+   - If inference worker crashes, auto-restarts it and clears stale results.
 
 Current config intent:
 
@@ -302,6 +306,14 @@ Recent behavior changes:
 10. Add **Moro reflex filter**: 2-3 month infants still exhibit the startle reflex (symmetric bilateral arm abduction). The system detects mirror-symmetric wrist motion vectors (angle >120°) and attenuates limb agitation by 70% and exposure ratio by 65% when Moro is detected, preventing false cry/exposure alerts from this involuntary reflex.
 11. **Threshold tuning for 2-3 month infants**: `exposure_duration_threshold` 15s→8s (poor thermoregulation), `face_absence_duration_threshold` 45s→10s (peak SIDS risk period).
 12. **Safe region overlay transparency** reduced from 0.15 to 0.08 for less visual obstruction.
+13. **Inference worker auto-restart**: when the inference worker thread crashes (e.g., MediaPipe error), `inference_client.py` now automatically stops the old worker, clears stale detection results, and starts a new worker — rather than freezing with the last cached result indefinitely.
+14. **Detection staleness indicator**: `preview_renderer.py` now tracks `result_age_s` (time since last detection result). When results are older than 2 seconds, detection boxes and text are hidden and a yellow `Detection stale: X.Xs` warning appears in the overlay, preventing stale cached results from misleading the viewer.
+15. **Multi-format camera frame decoding**: `inference_client.py` and `calibrate_region.py` now auto-detect frame format at runtime — supporting raw BGR, YUV420, RGB888, and legacy pickle+JPEG formats. This allows `camera_server.py` to switch formats without breaking clients.
+16. **Camera pipeline simplified**: `camera_server.py` switched to `picam2.capture_array()` (native BGR) instead of `capture_request()`/`make_array()`, eliminating manual buffer management. Added `raw={"size": (4608, 2592)}` to force full sensor array downsampling for maximum wide-angle FOV.
+17. **Prone detection timer decoupled**: previously prone detection reused the general `face_absence` timer (10s threshold). Now it uses a dedicated `face_mesh_absence_start_time` with a separate `face_mesh_absence_duration_threshold` (default 8s), so face-mesh-specific timing is independent of the general face-visibility tracking.
+18. **Graceful shutdown fix**: `main.py` now sets a `shutting_down` flag during `SIGINT`/`SIGTERM` handling. The watchdog restart logic checks this flag and skips restart when shutdown was intentional, preventing spurious restarts during clean exits.
+19. **Bug fix — audio_gateway.py**: fixed `visual_conf` → `visual_confidence` variable reference in `multimodal_fusion()` conflict-suppression branch.
+20. **Bug fix — supervision.py region edge-trigger**: fixed `region_exit` notification logic so the `last_in_region` state transition check correctly handles the `None → False` case (first frame where baby is already outside region), preventing missed exit notifications.
 
 ## Preview UI Reference
 

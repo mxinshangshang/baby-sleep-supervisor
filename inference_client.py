@@ -15,6 +15,7 @@ import struct
 import pickle
 import time
 import cv2
+import numpy as np
 import signal
 import threading
 from typing import Optional
@@ -40,10 +41,11 @@ def read_cpu_temp_c():
 class LatestFrameReceiver:
     """Continuously drains the camera TCP stream and keeps only the latest decoded frame."""
 
-    def __init__(self, connection, frame_width: int, frame_height: int):
+    def __init__(self, connection, frame_width: int, frame_height: int, frame_format: str = "YUV420"):
         self.connection = connection
         self.frame_width = frame_width
         self.frame_height = frame_height
+        self.frame_format = str(frame_format or "YUV420").upper()
         self.lock = threading.Lock()
         self.latest_frame = None
         self.latest_seq = 0
@@ -76,15 +78,23 @@ class LatestFrameReceiver:
                 if len(frame_data) != size:
                     raise ConnectionError("接收帧数据不完整")
 
-                # 优化点：直接接收原始 YUV420 数据，跳过 JPEG 解码
-                # YUV420 数据结构：Y(W*H) + U(W/2*H/2) + V(W/2*H/2)
-                frame_yuv = np.frombuffer(frame_data, dtype=np.uint8)
+                frame_array = np.frombuffer(frame_data, dtype=np.uint8)
+                expected_yuv_size = self.frame_width * self.frame_height * 3 // 2
+                expected_rgb_size = self.frame_width * self.frame_height * 3
 
-                # 重构 YUV420 数组形状 (H*3//2, W)
-                frame_yuv_reshaped = frame_yuv.reshape((self.frame_height * 3 // 2, self.frame_width))
-
-                # 转换为 BGR（只做一次，用于预览和检测）
-                frame_bgr = cv2.cvtColor(frame_yuv_reshaped, cv2.COLOR_YUV2BGR_I420)
+                if self.frame_format == "YUV420" and len(frame_data) == expected_yuv_size:
+                    frame_yuv = frame_array.reshape((self.frame_height * 3 // 2, self.frame_width))
+                    frame_bgr = cv2.cvtColor(frame_yuv, cv2.COLOR_YUV2BGR_I420)
+                elif self.frame_format in ("RGB888", "RGB") and len(frame_data) == expected_rgb_size:
+                    frame_rgb = frame_array.reshape((self.frame_height, self.frame_width, 3))
+                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                elif self.frame_format in ("BGR888", "BGR") and len(frame_data) == expected_rgb_size:
+                    frame_bgr = frame_array.reshape((self.frame_height, self.frame_width, 3)).copy()
+                else:
+                    raise ValueError(
+                        f"Unsupported frame payload: format={self.frame_format} size={len(frame_data)} "
+                        f"expected_yuv={expected_yuv_size} expected_rgb={expected_rgb_size}"
+                    )
 
                 with self.lock:
                     self.latest_frame = frame_bgr
@@ -141,6 +151,23 @@ class LatestInferenceWorker:
     def snapshot(self):
         with self.lock:
             return dict(self.latest_results), self.latest_results_seq, self.latest_results_time, self.actual_fps, self.target_fps, self.last_temp_c
+
+    def _clear_stale_results(self, reason: str):
+        now = time.time()
+        with self.lock:
+            self.latest_results = {
+                "timestamp": now,
+                "fps": self.actual_fps,
+                "events": [],
+                "detections": {
+                    "stale": {
+                        "status": "cleared",
+                        "reason": reason,
+                    }
+                },
+            }
+            self.latest_results_seq = -1
+            self.latest_results_time = now
 
     def _run(self):
         next_inference_time = 0.0
@@ -199,6 +226,7 @@ def main():
     camera_cfg = config.get("camera", {})
     frame_width = camera_cfg.get("width", 1536)
     frame_height = camera_cfg.get("height", 864)
+    frame_format = camera_cfg.get("format", "YUV420")
 
     inference_cfg = config.get("inference", {})
     preview_cfg = config.get("preview", {})
@@ -286,7 +314,7 @@ def main():
                         client_socket.connect((host, port))
                         client_socket.settimeout(None)
                         connection = client_socket.makefile('rb')
-                        receiver = LatestFrameReceiver(connection, frame_width, frame_height)
+                        receiver = LatestFrameReceiver(connection, frame_width, frame_height, frame_format)
                         receiver.start()
                         inference_worker = LatestInferenceWorker(
                             supervisor, receiver, normal_inference_fps, throttle_inference_fps,
@@ -309,6 +337,19 @@ def main():
                 time.sleep(0.1)
                 continue
 
+            if inference_worker is not None and not inference_worker.running:
+                if inference_worker.error:
+                    print(f"算法线程退出: {inference_worker.error}，正在重启算法线程")
+                inference_worker.stop()
+                inference_worker._clear_stale_results("inference_worker_stopped")
+                inference_worker = LatestInferenceWorker(
+                    supervisor, receiver, normal_inference_fps, throttle_inference_fps,
+                    temp_warn_c, thermal_enabled, temp_check_interval
+                )
+                inference_worker.start()
+                time.sleep(0.05)
+                continue
+
             frame, seq, frame_time = receiver.snapshot()
             if frame is None:
                 time.sleep(0.01)
@@ -327,6 +368,9 @@ def main():
                     status["fps"] = preview_fps_actual
                     render_results = dict(results)
                     render_results["fps"] = preview_fps_actual
+                    render_results["camera_seq"] = seq
+                    render_results["result_seq"] = result_seq
+                    render_results["result_age_s"] = max(0.0, now - result_time) if result_time else 999.0
                     render_frame = renderer.render(
                         frame,
                         render_results,

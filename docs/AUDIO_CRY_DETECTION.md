@@ -125,11 +125,16 @@ python test_audio.py
 | 文件 | 变更 |
 |------|------|
 | `src/audio_detector.py` | ✅ 新建，音频核心检测逻辑 |
+| `src/audio_gateway.py` | ✅ 独立进程音频采集 + 多模态融合 `multimodal_fusion()` |
 | `src/__init__.py` | ✅ 更新，导出音频模块 |
 | `src/supervision.py` | ✅ 集成音频检测 + 多模态融合 |
 | `config.yaml` | ✅ 启用音频配置 |
 | `test_audio.py` | ✅ 新建，快速测试脚本 |
 | `docs/AUDIO_CRY_DETECTION.md` | ✅ 本文档 |
+
+### 最近修复
+
+- `audio_gateway.py`: 修复 `multimodal_fusion()` 冲突抑制分支中的变量引用错误 (`visual_conf` → `visual_confidence`)，确保"音频强但视觉否定"场景下的降级逻辑正确生效。
 
 ---
 

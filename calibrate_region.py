@@ -171,27 +171,24 @@ class RegionCalibrator:
         if len(frame_data) != size:
             raise RuntimeError("接收帧数据不完整")
 
-        # 支持两种格式：新的原始 YUV420 格式，旧的 pickle+JPEG 格式
+        w = self.config["camera"]["width"]
+        h = self.config["camera"]["height"]
+
+        # 新格式：原始 BGR 数据（无对齐问题）
+        expected_bgr_size = w * h * 3
+        if len(frame_data) == expected_bgr_size:
+            frame_bgr = np.frombuffer(frame_data, dtype=np.uint8)
+            return frame_bgr.reshape((h, w, 3))
+
+        # 回退到旧的 pickle+JPEG 格式
         try:
-            # 尝试 YUV420 原始数据（新格式）
-            frame_yuv = np.frombuffer(frame_data, dtype=np.uint8)
-            w = self.config["camera"]["width"]
-            h = self.config["camera"]["height"]
-            # 验证数据长度是否匹配 YUV420
-            expected_size = w * h * 3 // 2
-            if len(frame_yuv) == expected_size:
-                frame_yuv_reshaped = frame_yuv.reshape((h * 3 // 2, w))
-                frame = cv2.cvtColor(frame_yuv_reshaped, cv2.COLOR_YUV2BGR_I420)
-                return frame
-            # 不匹配，回退尝试旧格式
-            raise ValueError("Size mismatch")
-        except Exception:
-            # 回退到旧的 pickle+JPEG 格式
             encoded_frame = pickle.loads(frame_data)
             frame = cv2.imdecode(encoded_frame, cv2.IMREAD_COLOR)
             if frame is None:
                 raise RuntimeError("帧解码失败")
             return frame
+        except Exception as e:
+            raise RuntimeError(f"帧格式不兼容: {e}")
 
     def close_connection(self):
         if self.connection is not None:

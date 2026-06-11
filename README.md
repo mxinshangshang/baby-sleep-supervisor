@@ -131,9 +131,9 @@ cd /home/mxin/.openclaw/workspace/baby_sleep_supervisor
 ```text
 baby_sleep_supervisor/
 ├── main.py                 # 主启动器，双进程管理
-├── camera_server.py        # 摄像头采集服务
-├── inference_client.py     # 推理和业务逻辑客户端
-├── calibrate_region.py     # 安全区域校准工具
+├── camera_server.py        # 摄像头采集服务（原生BGR，零拷贝传输）
+├── inference_client.py     # 推理和业务逻辑客户端（多格式自适应解码）
+├── calibrate_region.py     # 安全区域校准工具（多格式自适应解码）
 ├── config.yaml             # 配置文件
 ├── requirements.txt        # 依赖列表
 ├── setup_venv.py           # 虚拟环境搭建脚本
@@ -141,9 +141,11 @@ baby_sleep_supervisor/
 ├── start_headless.sh       # 无头模式启动脚本
 ├── src/
 │   ├── config.py           # 配置加载模块
-│   ├── supervision.py      # 监督逻辑核心
+│   ├── supervision.py      # 监督逻辑核心（趴睡/区域/哭闹/遮挡/裸露）
+│   ├── audio_detector.py   # 音频哭声频谱分析
+│   ├── audio_gateway.py    # 多模态音频-视觉融合网关
 │   ├── notifier.py         # 通知模块（飞书）
-│   ├── preview_renderer.py # 预览窗口渲染
+│   ├── preview_renderer.py # 预览窗口渲染（含检测过期指示）
 │   ├── storage.py          # 数据存储模块
 │   └── vision/
 │       ├── face_detector.py    # 人脸/表情/口鼻遮挡检测
@@ -152,6 +154,7 @@ baby_sleep_supervisor/
 ├── data/
 │   ├── photos/             # 异常事件抓拍照片
 │   └── events.db           # 事件数据库
+├── scripts/                # 辅助脚本
 └── docs/                   # 文档目录
 ```
 
@@ -163,8 +166,8 @@ baby_sleep_supervisor/
 
 系统由 `main.py` 统一管理两个子进程：
 
-1. `camera_server.py` 使用系统 Python 启动，负责 Picamera2 摄像头初始化、采集、JPEG 编码和 TCP 帧发送。
-2. `inference_client.py` 使用 `kid_supervisor_v3` 的 Python 3.11 虚拟环境启动，负责接收帧、运行 MediaPipe/OpenCV 推理、渲染预览和触发告警。
+1. `camera_server.py` 使用系统 Python 启动，负责 Picamera2 摄像头初始化、采集、原生 BGR 帧 TCP 发送（零 JPEG 编解码，客户端自适应解码）。
+2. `inference_client.py` 使用 `kid_supervisor_v3` 的 Python 3.11 虚拟环境启动，负责接收帧（多格式自适应：BGR/YUV420/RGB888/pickle+JPEG）、运行 MediaPipe/OpenCV 推理、渲染预览和触发告警。
 
 这样可以把摄像头驱动依赖和 AI 推理依赖隔离开：摄像头继续使用 Raspberry Pi OS 原生 `picamera2` 环境，推理继续复用已经验证可用的 MediaPipe 环境。
 
@@ -250,14 +253,16 @@ safe_region:
 | 模块 | 职责 | 关键点 |
 |------|------|--------|
 | `main.py` | 主启动器和守护进程 | 管理摄像头/推理两个子进程，处理自动重启、安全退出和 `q` 键信号 |
-| `camera_server.py` | 摄像头采集服务 | 使用 Picamera2 获取画面，通过 TCP 向推理端发送 JPEG 帧 |
-| `inference_client.py` | 推理客户端 | 连接摄像头服务，解码帧，调用监督器，渲染预览，处理快捷键 |
-| `calibrate_region.py` | 安全区域标定工具 | 在摄像头预览中手动点击四个角点，保存到 `config.yaml` |
+| `camera_server.py` | 摄像头采集服务 | 使用 Picamera2 `capture_array()` 获取原生BGR帧，通过 TCP 发送原始像素数据（零JPEG编解码） |
+| `inference_client.py` | 推理客户端 | 连接摄像头服务，多格式自适应解码（BGR/YUV420/RGB888/pickle+JPEG），调用监督器，渲染预览，处理快捷键 |
+| `calibrate_region.py` | 安全区域标定工具 | 在摄像头预览中手动点击四个角点，保存到 `config.yaml`，支持多格式帧解码 |
 | `src/config.py` | 配置加载 | 读取 YAML 配置并准备数据目录 |
-| `src/supervision.py` | 监督核心 | 串联人脸、姿态、区域、存储和通知逻辑 |
+| `src/supervision.py` | 监督核心 | 串联人脸、姿态、区域、音频、存储和通知逻辑 |
+| `src/audio_detector.py` | 音频检测 | 哭声频谱分析：RMS音量、基频峰值、频谱质心、高频能量占比 |
+| `src/audio_gateway.py` | 音频网关 | 独立进程采集音频，多模态融合（音频+视觉+动作），永远不阻塞主推理进程 |
 | `src/notifier.py` | 通知模块 | 发送控制台、飞书文本和飞书图片通知，优先复用 OpenClaw 通道 |
 | `src/storage.py` | 本地存储 | 保存异常照片和 SQLite 事件记录 |
-| `src/preview_renderer.py` | 预览渲染 | 绘制检测状态、安全区域、事件提示和快捷键帮助 |
+| `src/preview_renderer.py` | 预览渲染 | 绘制检测状态、安全区域、事件提示，检测过期时隐藏旧结果并显示警告 |
 | `src/vision/face_detector.py` | 人脸检测 | MediaPipe 人脸检测、Face Mesh、哭闹表情和口鼻遮挡特征 |
 | `src/vision/body_detector.py` | 姿态检测 | MediaPipe Pose、身体关键点和肢体裸露估算 |
 | `src/vision/region_detector.py` | 区域检测 | 矩形/多边形安全区域判断和区域绘制 |
@@ -269,19 +274,18 @@ Camera Module 3 Wide
         |
         v
 camera_server.py
-  Picamera2 capture_array()
-  OpenCV JPEG encode
-  TCP socket send
+  Picamera2 capture_array() → 原生 BGR
+  原始像素数据 TCP 发送（零编解码）
         |
         v
 inference_client.py
-  TCP receive
-  JPEG decode
-  SleepSupervisor.process_frame()
+  LatestFrameReceiver: TCP 接收，多格式自适应解码
+  LatestInferenceWorker: SleepSupervisor.process_frame()
         |
         +--> FaceDetector: 人脸、表情、口鼻遮挡
         +--> BodyDetector: 姿态、肢体裸露
         +--> RegionDetector: 是否在安全区域内
+        +--> AudioGateway: 音频哭声检测 + 多模态融合
         |
         v
 事件判断
@@ -291,7 +295,7 @@ inference_client.py
         |
         +--> Storage: 保存照片和事件数据库
         +--> Notifier: 控制台/飞书文本/飞书图片
-        +--> PreviewRenderer: 预览窗口叠加显示
+        +--> PreviewRenderer: 预览窗口叠加显示（含检测过期提示）
 ```
 
 摄像头进程和推理进程之间只传输图像帧，不直接共享摄像头对象。推理进程异常时不会直接持有摄像头设备，主进程可以更可靠地释放并重启摄像头服务。
@@ -364,7 +368,8 @@ camera:
   width: 640
   height: 480
   fps: 15
-  jpeg_quality: 80
+  format: YUV420
+  use_full_sensor_fov: true
 
 # 检测配置
 detection:
@@ -431,21 +436,27 @@ storage:
 
 1. 单摄像头本地监护。
 2. 摄像头采集和 AI 推理双进程隔离。
-3. MediaPipe 人脸、Face Mesh、Pose 推理。
-4. 哭闹表情启发式检测。
-5. 口鼻遮挡启发式检测。
-6. 肢体裸露/踢被子启发式检测。
-7. 矩形或四点/多点多边形安全区域检测。
-8. 异常事件抓拍和 SQLite 事件记录。
-9. OpenClaw 飞书通道复用，支持异常文本和图片通知。
-10. 预览模式和无头后台模式。
-11. 子进程异常自动重启和 `q` 键安全重启/退出。
+3. 原生 BGR 零编解码传输，多格式自适应解码（BGR/YUV420/RGB888/pickle+JPEG）。
+4. 强制完整传感器阵列下采样，最大化广角。
+5. MediaPipe 人脸、Face Mesh、Pose 推理。
+6. 哭闹表情启发式检测 + 多模态融合（音频+视觉+动作）。
+7. 音频哭声频谱分析（独立进程，不阻塞主推理）。
+8. 口鼻遮挡启发式检测。
+9. 趴睡/面部朝下检测（2-3月龄 SIDS 高风险）。
+10. 惊跳反射（Moro Reflex）过滤。
+11. 肢体裸露/踢被子启发式检测。
+12. 矩形或四点/多点多边形安全区域检测（边缘触发通知）。
+13. 异常事件抓拍和 SQLite 事件记录。
+14. OpenClaw 飞书通道复用，支持异常文本和图片通知。
+15. 预览模式和无头后台模式。
+16. 子进程异常自动重启和 `q` 键安全重启/退出。
+17. 推理工作线程崩溃自动重启，过期检测结果清除。
+18. 预览界面检测过期提示（结果>2s时隐藏并显示警告）。
 
 ### 配置存在但不是当前主链路
 
-1. 声音哭闹检测配置存在，但当前核心告警链路主要依赖视觉表情检测。
-2. 呼吸异常相关配置存在，但当前版本没有把呼吸检测作为稳定主功能。
-3. 温控配置存在，后续可以继续接入动态调节推理帧率和模型复杂度。
+1. 呼吸异常相关配置存在，但当前版本没有把呼吸检测作为稳定主功能。
+2. 温控配置存在，后续可以继续接入动态调节推理帧率和模型复杂度。
 
 ### 当前技术限制
 

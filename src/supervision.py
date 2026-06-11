@@ -75,7 +75,9 @@ class SleepSupervisor:
         # 趴睡检测
         self.prone_enabled = detection_cfg.get("prone_detection_enabled", True)
         self.prone_duration_threshold = detection_cfg.get("prone_duration_threshold", 5.0)
+        self.face_mesh_absence_duration_threshold = detection_cfg.get("face_mesh_absence_duration_threshold", 8.0)
         self.prone_start_time: Optional[float] = None
+        self.face_mesh_absence_start_time: Optional[float] = None
 
         # 状态跟踪
         self.cry_start_time: Optional[float] = None
@@ -855,17 +857,23 @@ class SleepSupervisor:
         if self.prone_enabled and presence["confirmed"]:
             posture = baby_topology.get("posture", "unknown")
             face_landmarks_ok = face_summary.get("landmarks_available", False)
-            face_absence_active = (results["detections"].get("face_absence", {}).get("status") == "not_visible")
-            face_absence_dur = results["detections"].get("face_absence", {}).get("duration_s", 0.0)
             head_bbox_exists = bool(baby_topology.get("head_bbox") or pose_summary.get("head_bbox"))
+
+            if head_bbox_exists and not face_landmarks_ok:
+                if self.face_mesh_absence_start_time is None:
+                    self.face_mesh_absence_start_time = now
+                face_mesh_absence_dur = now - self.face_mesh_absence_start_time
+            else:
+                self.face_mesh_absence_start_time = None
+                face_mesh_absence_dur = 0.0
 
             prone_suspected = False
             prone_reason = ""
 
             # 头框可见但FaceMesh持续不可用 → 高度怀疑面部朝下/埋入床垫
-            if head_bbox_exists and not face_landmarks_ok and face_absence_active and face_absence_dur >= 10.0:
+            if head_bbox_exists and not face_landmarks_ok and face_mesh_absence_dur >= self.face_mesh_absence_duration_threshold:
                 prone_suspected = True
-                prone_reason = f"head_visible_face_down_suspected_{face_absence_dur:.0f}s"
+                prone_reason = f"head_visible_face_mesh_missing_{face_mesh_absence_dur:.0f}s"
 
             if prone_suspected:
                 if self.prone_start_time is None:
@@ -883,7 +891,7 @@ class SleepSupervisor:
                         event_type="prone_detected",
                         level="danger",
                         message=f"疑似面部朝下（趴睡风险），面部不可见 {prone_dur:.1f}s",
-                        details={"posture": posture, "reason": prone_reason, "face_absence_s": face_absence_dur},
+                        details={"posture": posture, "reason": prone_reason, "face_mesh_absence_s": face_mesh_absence_dur},
                         photo_path=photo_path
                     )
                     self.notifier.send_alert(
@@ -891,7 +899,7 @@ class SleepSupervisor:
                         level="danger",
                         message="疑似面部朝下，请检查睡姿",
                         photo_path=photo_path,
-                        details={"姿势": posture, "面部不可见": f"{face_absence_dur:.0f}s", "事件ID": event_id}
+                        details={"姿势": posture, "面部关键点不可读": f"{face_mesh_absence_dur:.0f}s", "事件ID": event_id}
                     )
                     results["events"].append({
                         "type": "prone_detected",
@@ -909,6 +917,7 @@ class SleepSupervisor:
                 }
         elif self.prone_enabled:
             self.prone_start_time = None
+            self.face_mesh_absence_start_time = None
 
         # 🎙️ 获取最新音频特征（永远不阻塞！队列为空返回上次值）
         audio_features = self.audio_gateway.get_latest_features() if self.audio_enabled else None
@@ -1233,12 +1242,15 @@ class SleepSupervisor:
                 # 不再因为"只有头在区域内"或"只有躯干中心在区域内"就判定在区域内
                 # 必须满足：躯干和身体都有足够的重叠比例
                 if torso_overlap >= 0.65 and body_overlap >= 0.50:
+                    in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_and_body_overlap"
                 elif torso_center_in_region and body_overlap >= 0.45:
+                    in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_center_plus_body"
                 elif torso_overlap >= 0.50 and body_center_in_region:
+                    in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_overlap_plus_center"
                 else:
@@ -1310,7 +1322,8 @@ class SleepSupervisor:
                     self.region_exit_candidate_photo = frame.copy()
                 elif now - self.region_exit_start_time >= self.region_exit_duration_threshold:
                     # 确认后：用缓存的照片（状态刚变化时的那一帧）发送通知
-                    if self.last_in_region is True and self.region_exit_candidate_photo is not None:
+                    should_notify_exit = self.last_in_region is not False
+                    if should_notify_exit and self.region_exit_candidate_photo is not None:
                         photo_path = self.storage.save_photo(self.region_exit_candidate_photo, now)
                         event_id = self.storage.save_event(
                             event_type="region_exit",

@@ -5,8 +5,8 @@ camera:
   width: 640
   height: 480
   fps: 15
-  jpeg_quality: 80
-  format: RGB888
+  format: YUV420
+  use_full_sensor_fov: true
   device_id: 0
 
 network:
@@ -74,6 +74,7 @@ detection:
   face_absence_detection_enabled: true
   face_absence_duration_threshold: 10.0  # SIDS高风险期，缩短响应
   prone_detection_enabled: true
+  face_mesh_absence_duration_threshold: 8.0
   prone_duration_threshold: 5.0
   moro_reflex_filter_enabled: true
   motion_window_size: 12
