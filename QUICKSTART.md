@@ -119,6 +119,16 @@ sudo systemctl start baby-supervisor
 - `s`: 显示/隐藏统计信息
 - `c`: 提示单独运行区域校准工具
 
+### 4.4 预览界面颜色 / 文字说明
+完整的预览 UI 含义（各种颜色框、状态文字、事件条、状态栏）参见
+[`docs/RECENT_DESIGN_UPDATES.md` → Preview UI Reference](docs/RECENT_DESIGN_UPDATES.md#preview-ui-reference)。
+要点速记：
+- 🟢 绿色 = 正常 / 在安全区域内
+- 🟡 黄色 = 警告 / 不确定
+- 🔴 红色 = 危险
+- 🔵 蓝色框 = 人脸 ｜ 🟣 紫色框 = 躯干 ｜ 🟠 橙色框 = 头部 ｜ 🩵 青色 = 姿态骨骼
+- 身体 bbox **只在 `uncertain` / `out_of_region` 时显示**，避免和绿色安全区域重叠混淆
+
 ## 5. 性能优化建议
 
 ### 5.1 散热

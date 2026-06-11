@@ -296,3 +296,89 @@ Recent behavior changes:
 4. Cache successful FaceMesh ROI angle/scale to reduce CPU.
 5. Add result age to the overlay so cached detection boxes are visually distinguishable from the live camera frame.
 6. Validate the temporal cry analyzer in daylight against real crying, yawning, open-mouth sleep, and normal limb movement clips.
+7. Fix occlusion ghost alarms: reduce smoothing window from 10 → 4 frames (≈2s at 2fps), and require `occlusion_confidence >= 0.5` for the *current* frame to continue the alert countdown, so a transient high score from 5 seconds ago cannot keep triggering alerts after the occluder (hand/blanket/pillow/toy) has moved away.
+8. Change region alerts from level-triggered to edge-triggered: notify **only once** when the baby *exits* the safe region and **only once** when the baby *re-enters* the safe region, instead of continuously repeating alerts while the baby stays outside. Added `self.last_in_region` state variable to track the previous state and only fire notifications on transitions.
+
+## Preview UI Reference
+
+This section documents what every box, line, and text label on the live preview window means. It is intentionally exhaustive so that on-call viewers do not need to read the renderer source to interpret a frame.
+
+### Color legend
+
+| Color | Semantic | Used by |
+|-------|----------|---------|
+| 🟢 Green | Normal / safe / in-region | Safe Region overlay, normal-state texts (Presence Yes, Cry low, Coverage normal) |
+| 🟡 Yellow | Warning / uncertain | Out-of-region uncertain, head/face briefly hidden (<15s), mid-confidence cry (0.5–0.7), mid occlusion (0.3–0.6), `limb_exposed`, `Hand nearby` |
+| 🔴 Red | Danger | High-confidence cry (≥0.7), airway occlusion (>0.6), head/face hidden ≥15s, body/legs exposed, `Airway occluder` hand, `out_of_region` |
+| 🔵 Blue | Face detection bbox | `draw_face_detections()` |
+| 🟣 Magenta/Purple | Torso bbox | Region detection (`torso_bbox`) |
+| 🟠 Orange | Head bbox | Region detection (`head_bbox`) |
+| 🩵 Cyan | Pose skeleton + keypoints | MediaPipe pose landmarks |
+| ⚪ White | Neutral info text | FPS, Motion, generic stats |
+
+### Boxes and shapes on the image
+
+| Element | Source | Notes |
+|---------|--------|-------|
+| Green polygon + 15% green fill + corner dots + `Safe Region` text | `region_detector.draw_region()` | Static, set by `calibrate_region.py`. Always shown unless `show_safe_region=false`. |
+| Body bbox (green/yellow/red) | `draw_detection_results()` region section | **Only drawn when status is not `in_region`** to avoid visual confusion with the Safe Region overlay. Yellow = `uncertain`, red = `out_of_region`. |
+| Magenta torso bbox | Region section | Always drawn when topology is available. |
+| Orange head bbox | Region section | Always drawn when head is resolvable. |
+| Blue face bbox + `Face: 0.xx` | `draw_face_detections()` | One per detected face. |
+| Yellow hand bbox + `Hand nearby` | `draw_hand_detections()` | Hand visible but not on the airway ROI. |
+| Red hand bbox + `Airway occluder` | `draw_hand_detections()` | Hand overlaps mouth/nose ROI. Coupled with occlusion danger. |
+| Cyan skeleton + filled dots | `draw_pose_landmarks()` | Only landmarks with visibility > 0.5. |
+| Colored thin rectangle on mouth/nose ROI | Occlusion section | Color follows occlusion confidence. |
+
+### Top-left text panel (row order)
+
+Lines are stacked vertically at fixed Y offsets so the layout is stable across frames.
+
+| Y | Field | Format example | Color meaning |
+|---|-------|----------------|---------------|
+| 30 | Presence | `Presence: Yes 0.92` | Green=confirmed / yellow=uncertain / white=none |
+| 50 | Face mode | `Face: Front face mesh n=1 c=0.88` | White |
+| 70 | Cry | `Cry: 0.42 high M0.70 R0.12 H0.04 L0.08` | Red≥0.7 / yellow 0.5–0.7 / green<0.5 |
+| 90 | Occlusion | `Occlusion: 0.55` or `Occlusion(fallback): 0.40` | Red>0.6 / yellow>0.3 / green |
+| 110 | Coverage | `Coverage: 0.50 limb_exposed` | Red=body/legs / yellow=limb / green=normal |
+| 130 | Exposed limbs | `Limbs: arm, leg` | Same color as coverage |
+| 150 | Region | `Region: in_region` | Red=out / yellow=uncertain / green=in |
+| 170 | Face absence | `Head/face hidden: 8.5s` | Yellow<15s / red≥15s |
+| 190 | Face yaw | `Face yaw: 0.46` | White |
+| 210 | Motion | `Motion: H0.12 L0.40 A0.30` | White |
+| 230 | Posture | `Posture: side_lying topo=1.00` | Green if topology reliable, else yellow |
+| 250 | Distress | `Distress: 0.49 weak_distress_evidence` | Red≥0.7 / yellow≥0.35; shown only if ≥0.35 |
+
+Overlay abbreviations for Cry: `M` sustained mouth open, `R` mouth rhythm, `H` head swing, `L` limb agitation (see Crying section above).
+
+### Top-right status bar
+
+`FPS: xx.x` (preview FPS) plus a stack of status tags below it:
+
+| Tag | Color | Trigger |
+|-----|-------|---------|
+| `NORMAL` | Green | No active anomaly |
+| `CRY` | Red | Active cry event |
+| `COVERAGE` | Yellow | Kicked-blanket / limb exposure |
+| `OCCLUSION` | Red | Airway occlusion |
+| `REGION EXIT` | Yellow | Baby outside safe region |
+| `HEAD/FACE HIDDEN` | Yellow | Face/head not visible past threshold |
+
+### Bottom event ribbon
+
+Up to 3 most recent events for the last `event_display_time` (5s default), drawn on a black translucent strip with the event level color:
+
+- `CRY Detected (conf: 0.xx)`
+- `OCCLUSION Detected (conf: 0.xx)`
+- `KICKED Blanket (ratio: 0.xx)`
+- `LEFT Safe Region`
+- `HEAD/FACE Hidden (xx.x s)`
+
+### Bottom-right keyboard hint
+
+When `show_help` is on, the renderer lists shortcuts: `q` quit, `h` help toggle, `d` boxes toggle, `r` region toggle, `s` stats toggle, `c` calibrate hint.
+
+### Design rule: avoid double-green confusion
+
+Earlier the body bbox was always rendered green when `in_region`, which overlapped visually with the green Safe Region polygon. The renderer now skips the body bbox when the region status is `in_region`; it only appears when status is `uncertain` (yellow) or `out_of_region` (red). The torso (magenta) and head (orange) boxes still render normally so motion tracking stays visible.
+

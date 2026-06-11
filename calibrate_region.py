@@ -5,6 +5,12 @@
 """
 import sys
 import os
+
+# 自动使用kid项目虚拟环境（和main.py架构一致）
+VENV_PYTHON = "/home/mxin/.openclaw/workspace/kid_supervisor_v3/venv_311/bin/python"
+if sys.executable != VENV_PYTHON:
+    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+
 import socket
 import struct
 import pickle

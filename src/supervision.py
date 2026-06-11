@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 from collections import deque
 
 from src.config import get_config
+from src.audio_gateway import AudioGateway, multimodal_fusion
 from src.vision.face_detector import FaceDetector
 from src.vision.body_detector import BodyDetector
 from src.vision.region_detector import RegionDetector
@@ -77,6 +78,9 @@ class SleepSupervisor:
         self.occlusion_start_time: Optional[float] = None
         self.region_exit_start_time: Optional[float] = None
         self.face_absence_start_time: Optional[float] = None
+        # Edge-triggered region alerts: only notify on ENTER / EXIT state transitions,
+        # not continuously while staying inside or outside the region.
+        self.last_in_region: Optional[bool] = None
         self.last_cry_confidence: float = 0.0
         self.last_cry_time: float = 0.0
         self.cry_hold_s: float = detection_cfg.get("cry_hold_s", 8.0)
@@ -87,7 +91,11 @@ class SleepSupervisor:
         # 平滑窗口
         self.cry_confidence_window = deque(maxlen=10)
         self.exposure_ratio_window = deque(maxlen=10)
-        self.occlusion_confidence_window = deque(maxlen=10)
+        # Reduced window from 10 → 4 frames (≈2 seconds at 2fps) to avoid
+        # ghost alarms: a transient high score 5 seconds ago should not
+        # keep triggering alerts long after the occluder (hand/blanket) has moved away.
+        # Short window + 1-second duration threshold still filters single-frame noise.
+        self.occlusion_confidence_window = deque(maxlen=4)
         self.presence_score_window = deque(maxlen=detection_cfg.get("presence_window_size", 8))
         self.region_exit_window = deque(maxlen=detection_cfg.get("region_exit_window_size", 8))
         self.head_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 12))
@@ -112,6 +120,18 @@ class SleepSupervisor:
         self.alert_cooldown = supervision_cfg.get("alert_cooldown_s", 60)
         self.last_alert_time: Dict[str, float] = {}
 
+        # 🎙️ 智能音频网关（独立进程模式，永不阻塞主循环）
+        audio_cfg = self.config.get("audio", {})
+        self.audio_enabled = audio_cfg.get("cry_detection_enabled", False)
+        self.audio_gateway = AudioGateway(
+            sample_rate=audio_cfg.get("sample_rate", 16000),  # 优化为16kHz，更轻量
+            device_id=audio_cfg.get("device_id", None)
+        )
+        if self.audio_enabled:
+            self.audio_gateway.start()  # 非阻塞，立即返回！
+        self.last_audio_cry_confidence = 0.0
+        self.audio_visual_fusion_enabled = True
+
         # 运行状态
         self.frame_count = 0
         self.last_frame_time = time.time()
@@ -133,6 +153,11 @@ class SleepSupervisor:
             return False
         self.last_alert_time[event_type] = now
         return True
+
+    def stop(self):
+        """停止监控，清理资源"""
+        if self.audio_gateway:
+            self.audio_gateway.stop()
 
     def _bbox_from_points(self, points: List[Tuple[float, float]], frame_shape: Tuple[int, int, int], padding: int) -> Optional[Tuple[int, int, int, int]]:
         if not points:
@@ -753,16 +778,46 @@ class SleepSupervisor:
                     "threshold_s": self.face_absence_duration_threshold,
                 }
 
+        # 🎙️ 获取最新音频特征（永远不阻塞！队列为空返回上次值）
+        audio_features = self.audio_gateway.get_latest_features() if self.audio_enabled else None
+        if audio_features:
+            self.last_audio_cry_confidence = audio_features.cry_confidence
+            results["detections"]["audio"] = {
+                "volume": audio_features.rms_volume,
+                "cry_confidence": audio_features.cry_confidence,
+                "pattern_match": audio_features.cry_pattern_match,
+                "is_crying": audio_features.is_crying,
+                "latency_ms": audio_features.processing_latency_ms,
+                "gateway_healthy": self.audio_gateway.is_healthy() if self.audio_enabled else False
+            }
+
         if self.cry_enabled:
             if landmarks is not None and presence["confirmed"]:
                 expression_confidence, cry_features = self.face_detector.detect_cry_expression(landmarks)
                 fused_cry, fusion_features = self._combine_cry_evidence(expression_confidence, cry_features, face_pose, motion_features)
                 cry_features.update(fusion_features)
                 smoothed_cry = self._get_smoothed_value(self.cry_confidence_window, fused_cry)
+
+                # 多模态融合：音频 + 视觉 + 动作 + 嘴巴状态（永远不阻塞！）
+                if self.audio_enabled and self.audio_visual_fusion_enabled and audio_features:
+                    motion_confidence = float(motion_features.get("agitation", 0.0))
+                    mouth_open = float(cry_features.get("mouth_open_score", 0.0))
+
+                    # 使用新的多模态融合（纯数学运算，<0.1ms）
+                    fusion_info = multimodal_fusion(
+                        audio_features,
+                        smoothed_cry,
+                        motion_confidence,
+                        mouth_open
+                    )
+                    cry_features.update(fusion_info)
+                    smoothed_cry = fusion_info['fused_confidence']
+
                 results["detections"]["cry"] = {
                     "confidence": smoothed_cry,
                     "status": "available",
-                    "features": cry_features
+                    "features": cry_features,
+                    "fused": self.audio_enabled and audio_features is not None
                 }
                 if smoothed_cry >= 0.55:
                     self.last_cry_confidence = smoothed_cry
@@ -830,12 +885,15 @@ class SleepSupervisor:
                         "reason": "face_mesh_temporarily_unavailable_recent_cry",
                         "features": {"recent_age_s": recent_age, "motion": motion_features}
                     }
-                elif presence["confirmed"] and (motion_features.get("agitation", 0.0) >= 0.18 or motion_features.get("head_motion", 0.0) >= 0.12):
-                    suspected = min(0.62, 0.35 + motion_features.get("agitation", 0.0) * 0.9 + motion_features.get("head_motion", 0.0) * 0.4)
+                # 【修复3】大幅提高仅凭动作触发哭闹的阈值
+                # 原阈值：agitation≥0.18 OR head_motion≥0.12 → 正常活动很容易达到
+                # 新阈值：必须同时满足多个高阈值条件，且置信度上限降低
+                elif presence["confirmed"] and (motion_features.get("agitation", 0.0) >= 0.45 and motion_features.get("head_motion", 0.0) >= 0.25 and motion_features.get("limb_motion", 0.0) >= 0.35):
+                    suspected = min(0.50, 0.30 + motion_features.get("agitation", 0.0) * 0.4)  # 置信度上限降到0.5，低于告警阈值0.7
                     results["detections"]["cry"] = {
                         "confidence": suspected,
                         "status": "suspected_no_mesh",
-                        "reason": "motion_distress_without_face_mesh",
+                        "reason": "high_motion_distress_without_face_mesh",
                         "features": {"motion": motion_features}
                     }
                 else:
@@ -869,7 +927,7 @@ class SleepSupervisor:
                     "reason": occlusion_features.get("reason"),
                     "features": occlusion_features
                 }
-                if smoothed_occlusion >= self.occlusion_threshold:
+                if smoothed_occlusion >= self.occlusion_threshold and occlusion_confidence >= 0.5:
                     if self.occlusion_start_time is None:
                         self.occlusion_start_time = now
                     elif now - self.occlusion_start_time >= self.occlusion_duration_threshold and self._should_alert("occlusion_detected"):
@@ -888,32 +946,9 @@ class SleepSupervisor:
                             photo_path=photo_path,
                             details={"置信度": f"{smoothed_occlusion:.2f}", "原因": str(occlusion_features.get("reason")), "事件ID": event_id}
                         )
-                        cry_data_now = results["detections"].get("cry", {})
-                        # If face/airway is blocked and cry cannot be visually read, send a paired
-                        # cry/distress notification too. This is what the parent expects when baby is
-                        # audibly crying but FaceMesh is unavailable.
-                        if presence.get("confirmed") and cry_data_now.get("status") in ("unavailable", "recent_hold", "suspected_no_mesh") and self._should_alert("cry_distress_paired"):
-                            paired_id = self.storage.save_event(
-                                event_type="cry_detected",
-                                level="warning",
-                                message=f"婴儿哭闹/烦躁疑似，同时存在口鼻/头脸遮挡风险 {smoothed_occlusion:.2f}",
-                                details={"paired_occlusion_event_id": event_id, "occlusion": occlusion_features, "cry": cry_data_now},
-                                photo_path=photo_path
-                            )
-                            self.notifier.send_alert(
-                                event_type="cry_detected",
-                                level="warning",
-                                message="婴儿哭闹/烦躁疑似 + 遮挡风险",
-                                photo_path=photo_path,
-                                details={"遮挡置信度": f"{smoothed_occlusion:.2f}", "原因": str(occlusion_features.get("reason")), "事件ID": paired_id}
-                            )
-                            results["events"].append({
-                                "type": "cry_detected",
-                                "level": "warning",
-                                "confidence": smoothed_occlusion,
-                                "event_id": paired_id,
-                                "photo_path": photo_path
-                            })
+                        # 【修复2】移除遮挡时的配对哭闹通知
+                        # 原逻辑：只要有遮挡且FaceMesh不可用，就额外发送哭闹通知 → 导致大量误报
+                        # 修改后：只发送遮挡通知，不附带哭闹误报
                         results["events"].append({
                             "type": "occlusion_detected",
                             "level": "danger",
@@ -932,7 +967,9 @@ class SleepSupervisor:
                     "features": {}
                 }
 
-        # Distress / suspected crying fallback after cry + occlusion are both known.
+        # 【修复4】禁用 distress fallback 通知（最严重的误报来源）
+        # 原逻辑：只要有轻微动作 + 轻微遮挡/脸部不可见 → 触发哭闹通知
+        # 修改后：仅保留 distress 作为内部状态显示，完全禁用通知功能
         if self.cry_enabled:
             cry_data_for_distress = results["detections"].get("cry", {})
             occlusion_data_for_distress = results["detections"].get("occlusion", {})
@@ -943,43 +980,10 @@ class SleepSupervisor:
                 "confidence": distress_conf,
                 "status": "available" if presence.get("confirmed") else "unavailable",
                 "features": distress_features,
+                "notification": "disabled_to_reduce_false_positives"
             }
-            distress_reason = distress_features.get("reason")
-            notifyable_distress = distress_reason in ("visual_cry", "airway_or_face_hidden_with_motion", "airway_risk_cry_unreadable")
-            if notifyable_distress and distress_conf >= self.distress_threshold:
-                if self.distress_start_time is None:
-                    self.distress_start_time = now
-                elif now - self.distress_start_time >= self.distress_duration_threshold and self._should_alert("cry_detected"):
-                    photo_path = self.storage.save_photo(frame, now)
-                    event_id = self.storage.save_event(
-                        event_type="cry_detected",
-                        level="warning",
-                        message=f"检测到婴儿哭闹/烦躁疑似，融合置信度 {distress_conf:.2f}",
-                        details=distress_features,
-                        photo_path=photo_path
-                    )
-                    self.notifier.send_alert(
-                        event_type="cry_detected",
-                        level="warning",
-                        message="婴儿哭闹/烦躁疑似",
-                        photo_path=photo_path,
-                        details={
-                            "融合置信度": f"{distress_conf:.2f}",
-                            "原因": str(distress_features.get("reason")),
-                            "遮挡分": f"{distress_features.get('occlusion_confidence', 0.0):.2f}",
-                            "动作": f"{distress_features.get('motion_agitation', 0.0):.2f}",
-                            "事件ID": event_id,
-                        }
-                    )
-                    results["events"].append({
-                        "type": "cry_detected",
-                        "level": "warning",
-                        "confidence": distress_conf,
-                        "event_id": event_id,
-                        "photo_path": photo_path
-                    })
-            else:
-                self.distress_start_time = None
+            # 不再发送任何 distress 相关的通知
+            self.distress_start_time = None
 
         if self.exposure_enabled:
             if pose_data is not None and presence["confirmed"] and pose_summary["quality"] >= 0.35:
@@ -1085,22 +1089,22 @@ class SleepSupervisor:
                 if head_center:
                     head_center_in_region = self.region_detector.point_in_region(head_center)
 
-                if torso_center_in_region:
+                # 【修复1】收紧区域判定逻辑：要求身体的主要部分在安全区域内
+                # 不再因为"只有头在区域内"或"只有躯干中心在区域内"就判定在区域内
+                # 必须满足：躯干和身体都有足够的重叠比例
+                if torso_overlap >= 0.65 and body_overlap >= 0.50:
                     region_status = "in_region"
-                    decision_basis = "torso_center"
-                elif torso_overlap >= self.region_torso_overlap_threshold:
+                    decision_basis = "torso_and_body_overlap"
+                elif torso_center_in_region and body_overlap >= 0.45:
                     region_status = "in_region"
-                    decision_basis = "torso_overlap"
-                elif head_center_in_region and body_overlap >= 0.20:
+                    decision_basis = "torso_center_plus_body"
+                elif torso_overlap >= 0.50 and body_center_in_region:
                     region_status = "in_region"
-                    decision_basis = "head_center"
-                elif body_center_in_region or body_overlap >= self.region_body_overlap_threshold:
-                    region_status = "in_region"
-                    decision_basis = "body_overlap"
+                    decision_basis = "torso_overlap_plus_center"
                 else:
                     in_region = False
                     region_status = "out_of_region"
-                    decision_basis = "confirmed_person_outside_region"
+                    decision_basis = "body_not_sufficiently_inside_region"
 
             region_features = {
                 "person_detected": presence["confirmed"],
@@ -1129,33 +1133,77 @@ class SleepSupervisor:
 
             self.region_exit_window.append(not in_region and presence["confirmed"])
             exit_ratio = sum(1 for v in self.region_exit_window if v) / len(self.region_exit_window)
+            confirmed_exit = (
+                presence["confirmed"]
+                and region_status == "out_of_region"
+                and exit_ratio >= self.region_exit_confirm_ratio
+            )
+            confirmed_in = (
+                presence["confirmed"]
+                and region_status == "in_region"
+                and exit_ratio <= 0.3
+            )
+
+            # Edge-triggered alerts: notify only on state transitions, not continuously.
+            # We still use the duration threshold to filter out single-frame flips.
             if not presence["confirmed"] or region_status in ("no_confirmed_person", "uncertain"):
                 self.region_exit_start_time = None
-            elif not in_region and exit_ratio >= self.region_exit_confirm_ratio:
+            elif confirmed_exit:
                 if self.region_exit_start_time is None:
                     self.region_exit_start_time = now
-                elif now - self.region_exit_start_time >= self.region_exit_duration_threshold and self._should_alert("region_exit"):
+                elif now - self.region_exit_start_time >= self.region_exit_duration_threshold:
+                    # Only send EXIT alert if we were previously confirmed inside.
+                    if self.last_in_region is True:
+                        photo_path = self.storage.save_photo(frame, now)
+                        event_id = self.storage.save_event(
+                            event_type="region_exit",
+                            level="warning",
+                            message="婴儿离开安全区域",
+                            details=region_features,
+                            photo_path=photo_path
+                        )
+                        self.notifier.send_alert(
+                            event_type="region_exit",
+                            level="warning",
+                            message="离开安全区域",
+                            photo_path=photo_path,
+                            details={"重叠比例": f"{body_overlap:.2f}", "事件ID": event_id}
+                        )
+                        results["events"].append({
+                            "type": "region_exit",
+                            "level": "warning",
+                            "event_id": event_id,
+                            "photo_path": photo_path
+                        })
+                    # Always update state after handling the transition.
+                    self.last_in_region = False
+                    self.region_exit_start_time = None  # prevent repeat alerts while staying out
+            elif confirmed_in:
+                # 进入区域通知（首次或从外部进入都通知）
+                if self.last_in_region is None or self.last_in_region is False:
                     photo_path = self.storage.save_photo(frame, now)
                     event_id = self.storage.save_event(
-                        event_type="region_exit",
+                        event_type="region_enter",
                         level="warning",
-                        message="婴儿离开安全区域",
+                        message="婴儿进入安全区域",
                         details=region_features,
                         photo_path=photo_path
                     )
                     self.notifier.send_alert(
-                        event_type="region_exit",
+                        event_type="region_enter",
                         level="warning",
-                        message="离开安全区域",
+                        message="回到安全区域",
                         photo_path=photo_path,
                         details={"重叠比例": f"{body_overlap:.2f}", "事件ID": event_id}
                     )
                     results["events"].append({
-                        "type": "region_exit",
-                        "level": "warning",
+                        "type": "region_enter",
+                        "level": "info",
                         "event_id": event_id,
                         "photo_path": photo_path
                     })
+                self.last_in_region = True
+                self.region_exit_start_time = None
             else:
                 self.region_exit_start_time = None
 

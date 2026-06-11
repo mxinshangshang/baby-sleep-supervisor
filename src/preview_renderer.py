@@ -26,6 +26,7 @@ class PreviewRenderer:
             "normal": (0, 255, 0),      # Green - Normal
             "warning": (0, 255, 255),   # Yellow - Warning
             "danger": (0, 0, 255),      # Red - Danger
+            "info": (0, 255, 0),        # Green - Info (same as normal, for region enter)
             "text": (255, 255, 255),    # White - Text
             "text_bg": (0, 0, 0),       # Black - Text background
             "region": (0, 255, 0),      # Green - Safe region
@@ -256,7 +257,9 @@ class PreviewRenderer:
             cv2.putText(frame, text, (10, 150), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
 
-            if features.get("body_bbox"):
+            # Only draw body bbox on abnormal states (out_of_region / uncertain)
+            # to avoid visual confusion with the green Safe Region overlay when in_region.
+            if features.get("body_bbox") and status != "in_region":
                 x1, y1, x2, y2 = features["body_bbox"]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             if features.get("torso_bbox"):
