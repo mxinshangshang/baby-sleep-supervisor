@@ -139,7 +139,7 @@ class RegionDetector:
             # 半透明填充
             overlay = frame.copy()
             cv2.fillPoly(overlay, [self.polygon_np], color)
-            cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+            cv2.addWeighted(overlay, 0.08, frame, 0.92, 0, frame)
             # 绘制顶点
             for p in self.safe_region:
                 cv2.circle(frame, p, 3, color, -1)

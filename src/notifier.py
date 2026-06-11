@@ -33,6 +33,7 @@ class Notifier:
             "occlusion_detected",
             "limb_exposure",
             "region_exit",
+            "prone_detected",
         ]))
 
         self.console_enabled = notify_cfg.get("console_enabled", True)

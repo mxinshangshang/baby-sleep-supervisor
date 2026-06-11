@@ -41,7 +41,7 @@ detection:
   # 踢被子/肢体裸露检测
   limb_exposure_enabled: true
   exposure_threshold: 0.35       # 裸露/覆盖提示阈值；实际告警还会受拓扑和外部手臂过滤影响
-  exposure_duration_threshold: 15.0  # 持续时间阈值
+  exposure_duration_threshold: 8.0   # 2-3月龄体温调节差，缩短确认时间
 
   # 口鼻遮挡检测
   occlusion_detection_enabled: true
@@ -72,7 +72,10 @@ detection:
   region_exit_confirm_ratio: 0.7
   alert_requires_confirmed_presence: true
   face_absence_detection_enabled: true
-  face_absence_duration_threshold: 45.0
+  face_absence_duration_threshold: 10.0  # SIDS高风险期，缩短响应
+  prone_detection_enabled: true
+  prone_duration_threshold: 5.0
+  moro_reflex_filter_enabled: true
   motion_window_size: 12
 
   # 呼吸检测（实验性功能）
@@ -118,6 +121,7 @@ notification:
   enabled_alert_types:
     - cry_detected
     - occlusion_detected
+    - prone_detected
     - face_not_visible
     # Coverage/limb exposure is intentionally noisy in crib scenes; enable only if desired.
     # - limb_exposure

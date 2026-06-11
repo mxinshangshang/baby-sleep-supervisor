@@ -298,6 +298,10 @@ Recent behavior changes:
 6. Validate the temporal cry analyzer in daylight against real crying, yawning, open-mouth sleep, and normal limb movement clips.
 7. Fix occlusion ghost alarms: reduce smoothing window from 10 → 4 frames (≈2s at 2fps), and require `occlusion_confidence >= 0.5` for the *current* frame to continue the alert countdown, so a transient high score from 5 seconds ago cannot keep triggering alerts after the occluder (hand/blanket/pillow/toy) has moved away.
 8. Change region alerts from level-triggered to edge-triggered: notify **only once** when the baby *exits* the safe region and **only once** when the baby *re-enters* the safe region, instead of continuously repeating alerts while the baby stays outside. Added `self.last_in_region` state variable to track the previous state and only fire notifications on transitions.
+9. Add **prone/face-down detection**: when Pose detects a head bbox but FaceMesh cannot obtain facial landmarks for >10 seconds, the system suspects the baby's face is pressed downward. Triggers `danger` level `prone_detected` alert. Normal side-sleeping (FaceMesh still visible) does not trigger this.
+10. Add **Moro reflex filter**: 2-3 month infants still exhibit the startle reflex (symmetric bilateral arm abduction). The system detects mirror-symmetric wrist motion vectors (angle >120°) and attenuates limb agitation by 70% and exposure ratio by 65% when Moro is detected, preventing false cry/exposure alerts from this involuntary reflex.
+11. **Threshold tuning for 2-3 month infants**: `exposure_duration_threshold` 15s→8s (poor thermoregulation), `face_absence_duration_threshold` 45s→10s (peak SIDS risk period).
+12. **Safe region overlay transparency** reduced from 0.15 to 0.08 for less visual obstruction.
 
 ## Preview UI Reference
 

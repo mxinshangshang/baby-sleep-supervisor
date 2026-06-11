@@ -72,15 +72,25 @@ class SleepSupervisor:
         self.face_absence_enabled = detection_cfg.get("face_absence_detection_enabled", True)
         self.face_absence_duration_threshold = detection_cfg.get("face_absence_duration_threshold", 15.0)
 
+        # 趴睡检测
+        self.prone_enabled = detection_cfg.get("prone_detection_enabled", True)
+        self.prone_duration_threshold = detection_cfg.get("prone_duration_threshold", 5.0)
+        self.prone_start_time: Optional[float] = None
+
         # 状态跟踪
         self.cry_start_time: Optional[float] = None
         self.exposure_start_time: Optional[float] = None
         self.occlusion_start_time: Optional[float] = None
         self.region_exit_start_time: Optional[float] = None
+        self.region_enter_start_time: Optional[float] = None
         self.face_absence_start_time: Optional[float] = None
         # Edge-triggered region alerts: only notify on ENTER / EXIT state transitions,
         # not continuously while staying inside or outside the region.
         self.last_in_region: Optional[bool] = None
+        # 证据预缓存：状态刚变化时立即抓拍，防抖确认后用缓存的照片发送通知
+        # 确保通知画面与事件发生瞬间完全同步
+        self.region_enter_candidate_photo: Optional[np.ndarray] = None
+        self.region_exit_candidate_photo: Optional[np.ndarray] = None
         self.last_cry_confidence: float = 0.0
         self.last_cry_time: float = 0.0
         self.cry_hold_s: float = detection_cfg.get("cry_hold_s", 8.0)
@@ -287,14 +297,40 @@ class SleepSupervisor:
     def _compute_presence(self, pose_summary: Dict, face_summary: Dict, now: float) -> Dict:
         sources = []
         score = 0.0
-        if pose_summary.get("quality", 0) > 0:
-            sources.append("pose")
-            score += pose_summary["quality"] * 0.75
-        if face_summary.get("available"):
-            sources.append("face")
-            score += face_summary["quality"] * 0.35
-        if face_summary.get("landmarks_available"):
-            sources.append("face_landmarks")
+        pose_quality = pose_summary.get("quality", 0)
+        face_quality = face_summary.get("quality", 0)
+
+        # ============================================================
+        # 【姿态与人脸独立确认机制】
+        # 核心思想：正睡靠Pose，侧睡靠Face，两者只要一个够强就算有人
+        # - Pose 质量 >= 0.4 → 姿态确认
+        # - Face 质量 >= 0.5 → 人脸确认（侧睡场景）
+        # 避免：侧睡时Pose弱被误判为无人，同时过滤无Face的纯Pose误检
+        # ============================================================
+        pose_confirmed = pose_quality >= 0.40
+        face_confirmed = face_quality >= 0.50
+        has_valid_confirmation = pose_confirmed or face_confirmed
+
+        if has_valid_confirmation:
+            # 只要有一个确认源，基础得分直接拉到确认水平
+            score = 0.85
+            if pose_confirmed:
+                sources.append("pose")
+                score += pose_quality * 0.10  # Pose质量作为微调
+            if face_confirmed:
+                sources.append("face")
+                score += face_quality * 0.10  # Face质量作为微调
+                if face_summary.get("landmarks_available"):
+                    sources.append("face_landmarks")
+        else:
+            # 没有确认源时，用加权和作为弱信号（0~0.7之间）
+            if pose_quality > 0:
+                score += pose_quality * 0.60
+                sources.append("pose_weak")
+            if face_quality > 0:
+                score += face_quality * 0.30
+                sources.append("face_weak")
+
         score = min(1.0, score)
         self.presence_score_window.append(score)
         smoothed_score = sum(self.presence_score_window) / len(self.presence_score_window)
@@ -439,6 +475,9 @@ class SleepSupervisor:
 
         Values are normalized by body size so they remain comparable across camera distance.
         Motion is a supporting cry signal, not enough by itself to declare crying.
+
+        Also detects Moro reflex (startle): symmetric bilateral arm abduction, fast, brief.
+        When Moro is detected, limb agitation is attenuated to avoid false cry/exposure signals.
         """
         body_bbox = pose_summary.get("body_bbox")
         if body_bbox:
@@ -458,6 +497,9 @@ class SleepSupervisor:
         head_delta = 0.0
         limb_delta = 0.0
         visible_limb_count = 0
+        moro_detected = False
+        moro_confidence = 0.0
+
         if self.prev_motion_points:
             head_delta = self._point_distance(current.get("head"), self.prev_motion_points.get("head")) / body_diag
             limb_deltas = []
@@ -466,6 +508,30 @@ class SleepSupervisor:
                     limb_deltas.append(self._point_distance(current[key], self.prev_motion_points[key]) / body_diag)
             visible_limb_count = len(limb_deltas)
             limb_delta = float(sum(limb_deltas) / len(limb_deltas)) if limb_deltas else 0.0
+
+            # 【惊跳反射(Moro Reflex)检测】
+            # 特征：双臂镜像对称外展，快速短暂（0.5-1.5秒）
+            lw = current.get("left_wrist")
+            rw = current.get("right_wrist")
+            plw = self.prev_motion_points.get("left_wrist")
+            prw = self.prev_motion_points.get("right_wrist")
+            if lw is not None and rw is not None and plw is not None and prw is not None:
+                # 左右手腕移动向量
+                vl = np.array(lw, dtype=np.float32) - np.array(plw, dtype=np.float32)
+                vr = np.array(rw, dtype=np.float32) - np.array(prw, dtype=np.float32)
+                vl_norm = float(np.linalg.norm(vl))
+                vr_norm = float(np.linalg.norm(vr))
+                # 归一化距离阈值：手腕移动需要足够快
+                fast_enough = (vl_norm / body_diag) >= 0.03 and (vr_norm / body_diag) >= 0.03
+                if fast_enough and vl_norm > 0 and vr_norm > 0:
+                    # 计算两向量夹角的余弦值（-1=反向, 0=垂直, 1=同向）
+                    cos_angle = float(np.dot(vl, vr) / (vl_norm * vr_norm))
+                    # Moro反射：双臂向外展开 → 向量接近反向（cos < -0.5，即夹角>120度）
+                    if cos_angle < -0.5:
+                        moro_confidence = min(1.0, (abs(cos_angle) - 0.5) / 0.5)
+                        moro_detected = True
+                        # 衰减肢体运动：Moro是非自主反射，不应作为哭闹/躁动证据
+                        limb_delta *= 0.3
 
         self.prev_motion_points = current
         self.head_motion_window.append(min(1.0, head_delta * 5.0))
@@ -480,6 +546,8 @@ class SleepSupervisor:
             "raw_head_delta": head_delta,
             "raw_limb_delta": limb_delta,
             "visible_limb_count": visible_limb_count,
+            "moro_detected": moro_detected,
+            "moro_confidence": moro_confidence,
         }
 
     def _combine_cry_evidence(self, expression_confidence: float, cry_features: Dict, face_pose: Dict, motion_features: Dict) -> Tuple[float, Dict]:
@@ -778,6 +846,70 @@ class SleepSupervisor:
                     "threshold_s": self.face_absence_duration_threshold,
                 }
 
+        # ============================================================
+        # 【趴睡检测】
+        # 2-3月龄婴儿无法自主翻身，面部朝下有窒息风险。
+        # 侧睡本身正常（家长可能刻意侧放），只有当头框可见但FaceMesh
+        # 持续检测不到面部关键点时，才高度怀疑面部朝下/埋入床垫。
+        # ============================================================
+        if self.prone_enabled and presence["confirmed"]:
+            posture = baby_topology.get("posture", "unknown")
+            face_landmarks_ok = face_summary.get("landmarks_available", False)
+            face_absence_active = (results["detections"].get("face_absence", {}).get("status") == "not_visible")
+            face_absence_dur = results["detections"].get("face_absence", {}).get("duration_s", 0.0)
+            head_bbox_exists = bool(baby_topology.get("head_bbox") or pose_summary.get("head_bbox"))
+
+            prone_suspected = False
+            prone_reason = ""
+
+            # 头框可见但FaceMesh持续不可用 → 高度怀疑面部朝下/埋入床垫
+            if head_bbox_exists and not face_landmarks_ok and face_absence_active and face_absence_dur >= 10.0:
+                prone_suspected = True
+                prone_reason = f"head_visible_face_down_suspected_{face_absence_dur:.0f}s"
+
+            if prone_suspected:
+                if self.prone_start_time is None:
+                    self.prone_start_time = now
+                prone_dur = now - self.prone_start_time
+                results["detections"]["prone"] = {
+                    "status": "suspected",
+                    "duration_s": prone_dur,
+                    "reason": prone_reason,
+                    "posture": posture,
+                }
+                if prone_dur >= self.prone_duration_threshold and self._should_alert("prone_detected"):
+                    photo_path = self.storage.save_photo(frame, now)
+                    event_id = self.storage.save_event(
+                        event_type="prone_detected",
+                        level="danger",
+                        message=f"疑似面部朝下（趴睡风险），面部不可见 {prone_dur:.1f}s",
+                        details={"posture": posture, "reason": prone_reason, "face_absence_s": face_absence_dur},
+                        photo_path=photo_path
+                    )
+                    self.notifier.send_alert(
+                        event_type="prone_detected",
+                        level="danger",
+                        message="疑似面部朝下，请检查睡姿",
+                        photo_path=photo_path,
+                        details={"姿势": posture, "面部不可见": f"{face_absence_dur:.0f}s", "事件ID": event_id}
+                    )
+                    results["events"].append({
+                        "type": "prone_detected",
+                        "level": "danger",
+                        "duration_s": prone_dur,
+                        "event_id": event_id,
+                        "photo_path": photo_path
+                    })
+            else:
+                self.prone_start_time = None
+                results["detections"]["prone"] = {
+                    "status": "normal",
+                    "duration_s": 0.0,
+                    "reason": f"posture_{posture}_face_landmarks_{'ok' if face_landmarks_ok else 'missing'}",
+                }
+        elif self.prone_enabled:
+            self.prone_start_time = None
+
         # 🎙️ 获取最新音频特征（永远不阻塞！队列为空返回上次值）
         audio_features = self.audio_gateway.get_latest_features() if self.audio_enabled else None
         if audio_features:
@@ -988,6 +1120,14 @@ class SleepSupervisor:
         if self.exposure_enabled:
             if pose_data is not None and presence["confirmed"] and pose_summary["quality"] >= 0.35:
                 exposure_ratio, exposure_features = self.body_detector.detect_limb_exposure(frame, pose_data)
+
+                # 【惊跳反射过滤】Moro反射时手臂突然外展会瞬时提高肤色裸露比例。
+                # 检测到惊跳时衰减 exposure_ratio 并延长确认时间，避免误报。
+                moro_active = motion_features.get("moro_detected", False)
+                if moro_active:
+                    exposure_ratio *= 0.35  # 大幅衰减，惊跳不是真踢被子
+                    exposure_features["moro_suppressed"] = True
+
                 smoothed_exposure = self._get_smoothed_value(self.exposure_ratio_window, exposure_ratio)
                 exposed_limbs = exposure_features.get("exposed_limbs", [])
                 single_arm_only = len(exposed_limbs) == 1 and exposed_limbs[0] in ("left_arm", "right_arm")
@@ -1061,7 +1201,7 @@ class SleepSupervisor:
                 }
 
         if self.region_enabled:
-            in_region = True
+            in_region = False  # 默认为不在区域内，有人且满足条件才设为 True
             region_status = "no_confirmed_person" if not presence["confirmed"] else "uncertain"
             decision_basis = presence["reason"]
             body_overlap = 0.0
@@ -1142,19 +1282,36 @@ class SleepSupervisor:
                 presence["confirmed"]
                 and region_status == "in_region"
                 and exit_ratio <= 0.3
+                and torso_overlap >= 0.3  # 进入区域必须有至少30%躯干在床内，防止只伸手进去误判
             )
 
-            # Edge-triggered alerts: notify only on state transitions, not continuously.
-            # We still use the duration threshold to filter out single-frame flips.
+            # ============================================================
+            # 【边缘触发 + 证据预缓存】区域事件通知
+            # 核心机制：
+            #   1. 刚检测到状态变化时 → 立即抓拍并缓存（事件发生瞬间的证据）
+            #   2. 防抖持续确认期间 → 持续验证状态稳定性
+            #   3. 确认后发送通知 → 用预缓存的照片，不是当前帧
+            # 效果：通知画面与事件发生瞬间 100% 同步，同时保留防抖能力
+            # ============================================================
+
+            # 状态不确定或无人：清空所有计时器、缓存和状态记忆
             if not presence["confirmed"] or region_status in ("no_confirmed_person", "uncertain"):
                 self.region_exit_start_time = None
+                self.region_exit_candidate_photo = None
+                self.region_enter_start_time = None
+                self.region_enter_candidate_photo = None
+                self.last_in_region = None  # 关键：无人时重置区域状态记忆，防止残留旧状态
+
+            # 可能离开区域：检测到离开迹象 → 立即抓拍缓存 → 防抖确认
             elif confirmed_exit:
                 if self.region_exit_start_time is None:
+                    # 第0帧：刚检测到离开迹象 → 立即抓拍作为证据
                     self.region_exit_start_time = now
+                    self.region_exit_candidate_photo = frame.copy()
                 elif now - self.region_exit_start_time >= self.region_exit_duration_threshold:
-                    # Only send EXIT alert if we were previously confirmed inside.
-                    if self.last_in_region is True:
-                        photo_path = self.storage.save_photo(frame, now)
+                    # 确认后：用缓存的照片（状态刚变化时的那一帧）发送通知
+                    if self.last_in_region is True and self.region_exit_candidate_photo is not None:
+                        photo_path = self.storage.save_photo(self.region_exit_candidate_photo, now)
                         event_id = self.storage.save_event(
                             event_type="region_exit",
                             level="warning",
@@ -1175,37 +1332,52 @@ class SleepSupervisor:
                             "event_id": event_id,
                             "photo_path": photo_path
                         })
-                    # Always update state after handling the transition.
+                    # 更新状态，清空缓存
                     self.last_in_region = False
-                    self.region_exit_start_time = None  # prevent repeat alerts while staying out
+                    self.region_exit_start_time = None
+                    self.region_exit_candidate_photo = None
+
+            # 可能进入区域：检测到进入迹象 → 立即抓拍缓存 → 防抖确认
             elif confirmed_in:
-                # 进入区域通知（首次或从外部进入都通知）
-                if self.last_in_region is None or self.last_in_region is False:
-                    photo_path = self.storage.save_photo(frame, now)
-                    event_id = self.storage.save_event(
-                        event_type="region_enter",
-                        level="warning",
-                        message="婴儿进入安全区域",
-                        details=region_features,
-                        photo_path=photo_path
-                    )
-                    self.notifier.send_alert(
-                        event_type="region_enter",
-                        level="warning",
-                        message="回到安全区域",
-                        photo_path=photo_path,
-                        details={"重叠比例": f"{body_overlap:.2f}", "事件ID": event_id}
-                    )
-                    results["events"].append({
-                        "type": "region_enter",
-                        "level": "info",
-                        "event_id": event_id,
-                        "photo_path": photo_path
-                    })
-                self.last_in_region = True
-                self.region_exit_start_time = None
+                if self.region_enter_start_time is None:
+                    # 第0帧：刚检测到进入迹象 → 立即抓拍作为证据
+                    self.region_enter_start_time = now
+                    self.region_enter_candidate_photo = frame.copy()
+                elif now - self.region_enter_start_time >= self.region_exit_duration_threshold:
+                    # 确认后：用缓存的照片（状态刚变化时的那一帧）发送通知
+                    if (self.last_in_region is None or self.last_in_region is False) \
+                            and self.region_enter_candidate_photo is not None:
+                        photo_path = self.storage.save_photo(self.region_enter_candidate_photo, now)
+                        event_id = self.storage.save_event(
+                            event_type="region_enter",
+                            level="warning",
+                            message="婴儿进入安全区域",
+                            details=region_features,
+                            photo_path=photo_path
+                        )
+                        self.notifier.send_alert(
+                            event_type="region_enter",
+                            level="warning",
+                            message="回到安全区域",
+                            photo_path=photo_path,
+                            details={"重叠比例": f"{body_overlap:.2f}", "事件ID": event_id}
+                        )
+                        results["events"].append({
+                            "type": "region_enter",
+                            "level": "info",
+                            "event_id": event_id,
+                            "photo_path": photo_path
+                        })
+                    # 更新状态，清空缓存
+                    self.last_in_region = True
+                    self.region_enter_start_time = None
+                    self.region_enter_candidate_photo = None
+                    self.region_exit_start_time = None  # 进入后，离开计时器也重置
+
+            # 中间状态：重置计时器但保留缓存（避免单帧抖动导致缓存丢失）
             else:
                 self.region_exit_start_time = None
+                self.region_enter_start_time = None
 
         self.last_results = results
         return results, frame
@@ -1221,6 +1393,7 @@ class SleepSupervisor:
             "has_occlusion": self.occlusion_start_time is not None,
             "has_region_exit": self.region_exit_start_time is not None,
             "has_face_absence": self.face_absence_start_time is not None,
+            "has_prone": self.prone_start_time is not None,
         }
 
     def close(self):

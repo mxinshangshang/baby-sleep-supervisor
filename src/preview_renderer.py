@@ -198,12 +198,13 @@ class PreviewRenderer:
             dconf = distress.get("confidence", 0.0)
             if dconf >= 0.35:
                 dcolor = self.COLORS["danger"] if dconf >= 0.7 else self.COLORS["warning"]
-                cv2.putText(frame, f"Distress: {dconf:.2f} {distress.get('features',{}).get('reason','')}", (10, 250), self.FONT,
+                cv2.putText(frame, f"Distress: {dconf:.2f} {distress.get('features',{}).get('reason','')}", (10, 270), self.FONT,
                             self.FONT_SCALE_SMALL, dcolor, self.FONT_THICKNESS)
 
         if "motion" in detections:
             motion = detections["motion"]
-            cv2.putText(frame, f"Motion: H{motion.get('head_motion', 0):.2f} L{motion.get('limb_motion', 0):.2f} A{motion.get('agitation', 0):.2f}", (10, 210), self.FONT,
+            moro_tag = " Moro!" if motion.get("moro_detected") else ""
+            cv2.putText(frame, f"Motion: H{motion.get('head_motion', 0):.2f} L{motion.get('limb_motion', 0):.2f} A{motion.get('agitation', 0):.2f}{moro_tag}", (10, 210), self.FONT,
                         self.FONT_SCALE_SMALL, self.COLORS["text"], self.FONT_THICKNESS)
 
         # 绘制遮挡检测结果
@@ -224,6 +225,18 @@ class PreviewRenderer:
             if "roi_bbox" in occlusion_data["features"]:
                 x1, y1, x2, y2 = occlusion_data["features"]["roi_bbox"]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
+
+        # 绘制趴睡检测结果
+        if "prone" in detections:
+            prone = detections["prone"]
+            if prone.get("status") == "suspected":
+                color = self.COLORS["danger"]
+                text = f"Prone: {prone.get('duration_s', 0):.1f}s {prone.get('reason', '')}"
+            else:
+                color = self.COLORS["normal"]
+                text = f"Prone: {prone.get('status', 'normal')}"
+            cv2.putText(frame, text, (10, 250), self.FONT,
+                        self.FONT_SCALE_SMALL, color, self.FONT_THICKNESS)
 
         # 绘制肢体裸露检测结果
         if "limb_exposure" in detections:
@@ -298,6 +311,8 @@ class PreviewRenderer:
             status_texts.append(("OCCLUSION", self.COLORS["danger"]))
         if status.get("has_region_exit", False):
             status_texts.append(("REGION EXIT", self.COLORS["warning"]))
+        if status.get("has_prone", False):
+            status_texts.append(("PRONE", self.COLORS["danger"]))
         if status.get("has_face_absence", False):
             status_texts.append(("HEAD/FACE HIDDEN", self.COLORS["warning"]))
 
