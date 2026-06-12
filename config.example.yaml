@@ -141,3 +141,5 @@ audio:
   device_id: 0
   sample_rate: 16000
   cry_detection_enabled: false  # 声音辅助哭闹检测（实验性功能）
+  audio_only_cry_threshold: 0.85  # 纯音频快速通道：超过此阈值不依赖视觉直接通知
+  audio_only_cry_duration_s: 1.5  # 纯音频持续确认时间

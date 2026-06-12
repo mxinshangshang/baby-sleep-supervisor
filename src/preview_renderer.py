@@ -266,7 +266,12 @@ class PreviewRenderer:
             status = region_data.get("status", "in_region" if region_data["in_region"] else "out_of_region")
             color = self.COLORS["danger"] if status == "out_of_region" else self.COLORS["warning"] if status == "uncertain" else self.COLORS["normal"]
 
-            text = f"Region: {status}"
+            if region_data.get("exit_pending", False):
+                pending_s = region_data.get("exit_pending_s", 0.0)
+                text = f"Region: out_of_region pending {pending_s:.1f}s"
+                color = self.COLORS["warning"]  # 防抖确认中，显示黄色警告而非红色
+            else:
+                text = f"Region: {status}"
             cv2.putText(frame, text, (10, 150), self.FONT,
                         self.FONT_SCALE_NORMAL, color, self.FONT_THICKNESS)
 
@@ -412,7 +417,8 @@ class PreviewRenderer:
         # 绘制检测框
         detections = results.get("detections", {})
         result_age_s = float(results.get("result_age_s", 0.0))
-        detections_fresh = result_age_s <= 2.0
+        stale_threshold = float(results.get("result_stale_threshold_s", 2.0))
+        detections_fresh = result_age_s <= stale_threshold
         if not detections_fresh:
             cv2.putText(frame, f"Detection stale: {result_age_s:.1f}s", (10, 290), self.FONT,
                         self.FONT_SCALE_NORMAL, self.COLORS["warning"], self.FONT_THICKNESS)

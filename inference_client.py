@@ -276,6 +276,8 @@ def main():
 
     inference_worker: Optional[LatestInferenceWorker] = None
     next_preview_time = 0.0
+    last_inference_restart_time = 0.0
+    inference_restart_backoff_s = 3.0
 
     preview_count = 0
     last_stats_time = time.time()
@@ -338,8 +340,12 @@ def main():
                 continue
 
             if inference_worker is not None and not inference_worker.running:
+                _now = time.time()
+                if _now - last_inference_restart_time < inference_restart_backoff_s:
+                    time.sleep(0.1)
+                    continue
                 if inference_worker.error:
-                    print(f"算法线程退出: {inference_worker.error}，正在重启算法线程")
+                    print(f"算法线程退出: {inference_worker.error}，{inference_restart_backoff_s:.0f}s退避后重启")
                 inference_worker.stop()
                 inference_worker._clear_stale_results("inference_worker_stopped")
                 inference_worker = LatestInferenceWorker(
@@ -347,6 +353,7 @@ def main():
                     temp_warn_c, thermal_enabled, temp_check_interval
                 )
                 inference_worker.start()
+                last_inference_restart_time = _now
                 time.sleep(0.05)
                 continue
 
@@ -371,6 +378,7 @@ def main():
                     render_results["camera_seq"] = seq
                     render_results["result_seq"] = result_seq
                     render_results["result_age_s"] = max(0.0, now - result_time) if result_time else 999.0
+                    render_results["result_stale_threshold_s"] = max(2.0, 2.5 / max(1.0, target_inference_fps))
                     render_frame = renderer.render(
                         frame,
                         render_results,

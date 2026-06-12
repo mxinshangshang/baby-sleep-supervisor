@@ -44,12 +44,12 @@ class LightweightCryDetector:
         self.sample_rate = sample_rate
         self.frame_size = int(sample_rate * 0.5)  # 500ms 帧
 
-        # 哭声声学特征阈值（基于婴儿哭声研究）
-        self.volume_threshold = 0.05
-        self.pitch_min = 300    # Hz
-        self.pitch_max = 1200   # Hz
-        self.centroid_min = 800 # Hz
-        self.centroid_max = 3500 # Hz
+        # 哭声声学特征阈值（优化：降低音量阈值，提高灵敏度）
+        self.volume_threshold = 0.008  # 从0.05降低，提高对小声哭闹的检测
+        self.pitch_min = 250    # Hz，扩大范围
+        self.pitch_max = 1500   # Hz，扩大范围
+        self.centroid_min = 500 # Hz，扩大范围
+        self.centroid_max = 4000 # Hz，扩大范围
 
         # 平滑窗口
         self.confidence_window = []

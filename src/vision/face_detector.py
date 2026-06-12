@@ -50,8 +50,7 @@ class FaceDetector:
             min_tracking_confidence=0.5
         )
 
-        # 成人手遮挡是婴儿口鼻风险里的高优先级场景。FaceMesh 被手挡住时
-        # 往往直接失败，所以需要单独检测手与头脸区域是否重叠。
+        # Hands detector for occlusion (near head only, not full frame).
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
@@ -59,6 +58,14 @@ class FaceDetector:
             min_detection_confidence=max(0.25, min_detection_confidence * 0.7),
             min_tracking_confidence=0.5,
         )
+
+        # FaceMesh ROI 旋转重试缓存：缓存上次成功角度，下次优先尝试
+        self.last_success_roi_angle = 0.0
+
+        # FaceDetection 降频：FaceMesh成功时可降低BlazeFace频率
+        self.last_face_detect_time = 0.0
+        self.last_face_detect_result: List[Dict] = []
+        self.face_detect_interval_s = 0.5
 
     def _clip_bbox(self, bbox, w: int, h: int):
         x1, y1, x2, y2 = bbox
@@ -168,7 +175,9 @@ class FaceDetector:
         scale = max(1.0, target / float(max(roi.shape[:2])))
         roi_big = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale > 1.0 else roi
 
-        for angle in (0, -20, 20, -35, 35, -50, 50):
+        # 优先尝试上次成功的旋转角度，去重
+        angles = [self.last_success_roi_angle] + [a for a in (0, -20, 20, -35, 35, -50, 50) if a != self.last_success_roi_angle]
+        for angle in angles:
             rotated, inv = self._rotate_image(roi_big, angle)
             lm = self._try_mesh(rotated, roi_mode=True)
             if lm is None:
@@ -179,6 +188,7 @@ class FaceDetector:
             pts = pts / scale
             pts[:, 0] += x1
             pts[:, 1] += y1
+            self.last_success_roi_angle = angle  # 缓存成功角度
             return pts.astype(np.float32)
 
         return None

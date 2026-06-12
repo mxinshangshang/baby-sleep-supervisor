@@ -81,6 +81,7 @@ class SleepSupervisor:
 
         # 状态跟踪
         self.cry_start_time: Optional[float] = None
+        self.audio_only_cry_start_time: Optional[float] = None
         self.exposure_start_time: Optional[float] = None
         self.occlusion_start_time: Optional[float] = None
         self.region_exit_start_time: Optional[float] = None
@@ -112,6 +113,14 @@ class SleepSupervisor:
         self.region_exit_window = deque(maxlen=detection_cfg.get("region_exit_window_size", 8))
         self.head_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 12))
         self.limb_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 12))
+
+        # 手部检测缓存：FaceMesh可用时每1秒跑一次，不可用时每帧跑
+        self.hands_cache: List[Dict] = []
+        self.hands_cache_time = 0.0
+        self.hands_detect_interval_s = 1.0
+
+        # FaceDetection 降频：上一帧FaceMesh成功时跳过BlazeFace
+        self._last_facemesh_ok = False
         self.mouth_open_window = deque(maxlen=detection_cfg.get("mouth_open_window_size", 6))
         self.distress_window = deque(maxlen=detection_cfg.get("distress_window_size", 6))
         self.prev_mouth_open_score: Optional[float] = None
@@ -143,6 +152,8 @@ class SleepSupervisor:
             self.audio_gateway.start()  # 非阻塞，立即返回！
         self.last_audio_cry_confidence = 0.0
         self.audio_visual_fusion_enabled = True
+        self.audio_only_cry_threshold = audio_cfg.get("audio_only_cry_threshold", 0.85)
+        self.audio_only_cry_duration = audio_cfg.get("audio_only_cry_duration_s", 1.5)
 
         # 运行状态
         self.frame_count = 0
@@ -740,13 +751,31 @@ class SleepSupervisor:
             "detections": {}
         }
 
-        faces = self.face_detector.detect_faces(frame) if (self.cry_enabled or self.occlusion_enabled) else []
+        if self.cry_enabled or self.occlusion_enabled:
+            if self._last_facemesh_ok and now - self.face_detector.last_face_detect_time < self.face_detector.face_detect_interval_s:
+                faces = self.face_detector.last_face_detect_result
+            else:
+                faces = self.face_detector.detect_faces(frame)
+                self.face_detector.last_face_detect_result = faces
+                self.face_detector.last_face_detect_time = now
+        else:
+            faces = []
         hands = []
         pose_data = self.body_detector.detect_pose(frame) if (self.exposure_enabled or self.region_enabled) else None
         pose_summary = self._summarize_pose(pose_data, frame.shape)
         if self.occlusion_enabled and pose_summary.get("head_bbox"):
-            hands = self.face_detector.detect_hands_near_head(frame, pose_summary.get("head_bbox"))
+            should_detect_hands = (
+                not self._last_facemesh_ok  # FaceMesh不可用时每帧跑
+                or now - self.hands_cache_time >= self.hands_detect_interval_s
+            )
+            if should_detect_hands:
+                hands = self.face_detector.detect_hands_near_head(frame, pose_summary.get("head_bbox"))
+                self.hands_cache = hands
+                self.hands_cache_time = now
+            else:
+                hands = self.hands_cache
         landmarks = self.face_detector.detect_face_landmarks(frame, pose_summary.get("head_bbox")) if (self.cry_enabled or self.occlusion_enabled) else None
+        self._last_facemesh_ok = landmarks is not None
         face_pose = self.face_detector.classify_face_orientation(landmarks)
         face_summary = self._summarize_face(faces, landmarks)
         if face_pose.get("available"):
@@ -756,8 +785,10 @@ class SleepSupervisor:
             face_summary["available"] = True
             face_summary["face_count"] = max(1, int(face_summary.get("face_count", 0)))
             face_summary["main_face_confidence"] = max(float(face_summary.get("main_face_confidence", 0.0)), 1.0)
-            if not face_summary.get("main_face_bbox"):
-                face_summary["main_face_bbox"] = pose_summary.get("head_bbox")
+            # FaceMesh成功时直接从landmarks计算精准bbox，替代BlazeFace/head_bbox
+            x_min, y_min = landmarks.min(axis=0)
+            x_max, y_max = landmarks.max(axis=0)
+            face_summary["main_face_bbox"] = (x_min, y_min, x_max, y_max)
 
         # MediaPipe FaceDetection/FaceMesh is mostly a frontal/near-frontal face detector.
         # In crib top-view scenes a side face can be obvious to humans while FaceMesh returns
@@ -890,8 +921,8 @@ class SleepSupervisor:
                     event_id = self.storage.save_event(
                         event_type="prone_detected",
                         level="danger",
-                        message=f"疑似面部朝下（趴睡风险），面部不可见 {prone_dur:.1f}s",
-                        details={"posture": posture, "reason": prone_reason, "face_mesh_absence_s": face_mesh_absence_dur},
+                        message=f"疑似面部朝下（趴睡风险），面部关键点连续不可读 {face_mesh_absence_dur:.1f}s，二次确认 {prone_dur:.1f}s",
+                        details={"posture": posture, "reason": prone_reason, "face_mesh_absence_s": face_mesh_absence_dur, "prone_confirmation_s": prone_dur},
                         photo_path=photo_path
                     )
                     self.notifier.send_alert(
@@ -899,7 +930,7 @@ class SleepSupervisor:
                         level="danger",
                         message="疑似面部朝下，请检查睡姿",
                         photo_path=photo_path,
-                        details={"姿势": posture, "面部关键点不可读": f"{face_mesh_absence_dur:.0f}s", "事件ID": event_id}
+                        details={"姿势": posture, "面部关键点不可读": f"{face_mesh_absence_dur:.0f}s", "二次确认": f"{prone_dur:.0f}s", "事件ID": event_id}
                     )
                     results["events"].append({
                         "type": "prone_detected",
@@ -1209,6 +1240,7 @@ class SleepSupervisor:
                     "features": {}
                 }
 
+        region_status = "region_disabled"  # 兜底值，区域检测关闭时使用
         if self.region_enabled:
             in_region = False  # 默认为不在区域内，有人且满足条件才设为 True
             region_status = "no_confirmed_person" if not presence["confirmed"] else "uncertain"
@@ -1241,15 +1273,21 @@ class SleepSupervisor:
                 # 【修复1】收紧区域判定逻辑：要求身体的主要部分在安全区域内
                 # 不再因为"只有头在区域内"或"只有躯干中心在区域内"就判定在区域内
                 # 必须满足：躯干和身体都有足够的重叠比例
-                if torso_overlap >= 0.65 and body_overlap >= 0.50:
+                # 从配置派生阈值，替代硬编码值
+                body_thr = self.region_body_overlap_threshold
+                torso_thr = self.region_torso_overlap_threshold
+                body_loose_thr = max(0.35, body_thr - 0.10)
+                torso_loose_thr = max(0.35, torso_thr - 0.05)
+
+                if torso_overlap >= torso_thr and body_overlap >= body_thr:
                     in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_and_body_overlap"
-                elif torso_center_in_region and body_overlap >= 0.45:
+                elif torso_center_in_region and body_overlap >= body_loose_thr:
                     in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_center_plus_body"
-                elif torso_overlap >= 0.50 and body_center_in_region:
+                elif torso_overlap >= torso_loose_thr and body_center_in_region:
                     in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_overlap_plus_center"
@@ -1280,7 +1318,9 @@ class SleepSupervisor:
             results["detections"]["region"] = {
                 "in_region": in_region,
                 "status": region_status,
-                "features": region_features
+                "features": region_features,
+                "exit_pending": False,
+                "exit_pending_s": 0.0,
             }
 
             self.region_exit_window.append(not in_region and presence["confirmed"])
@@ -1306,13 +1346,13 @@ class SleepSupervisor:
             # 效果：通知画面与事件发生瞬间 100% 同步，同时保留防抖能力
             # ============================================================
 
-            # 状态不确定或无人：清空所有计时器、缓存和状态记忆
+            # 状态不确定或无人：清空计时器和缓存，但保留 last_in_region
+            # 避免短暂丢人后恢复时误发 region_enter
             if not presence["confirmed"] or region_status in ("no_confirmed_person", "uncertain"):
                 self.region_exit_start_time = None
                 self.region_exit_candidate_photo = None
                 self.region_enter_start_time = None
                 self.region_enter_candidate_photo = None
-                self.last_in_region = None  # 关键：无人时重置区域状态记忆，防止残留旧状态
 
             # 可能离开区域：检测到离开迹象 → 立即抓拍缓存 → 防抖确认
             elif confirmed_exit:
@@ -1320,35 +1360,41 @@ class SleepSupervisor:
                     # 第0帧：刚检测到离开迹象 → 立即抓拍作为证据
                     self.region_exit_start_time = now
                     self.region_exit_candidate_photo = frame.copy()
-                elif now - self.region_exit_start_time >= self.region_exit_duration_threshold:
-                    # 确认后：用缓存的照片（状态刚变化时的那一帧）发送通知
-                    should_notify_exit = self.last_in_region is not False
-                    if should_notify_exit and self.region_exit_candidate_photo is not None:
-                        photo_path = self.storage.save_photo(self.region_exit_candidate_photo, now)
-                        event_id = self.storage.save_event(
-                            event_type="region_exit",
-                            level="warning",
-                            message="婴儿离开安全区域",
-                            details=region_features,
-                            photo_path=photo_path
-                        )
-                        self.notifier.send_alert(
-                            event_type="region_exit",
-                            level="warning",
-                            message="离开安全区域",
-                            photo_path=photo_path,
-                            details={"重叠比例": f"{body_overlap:.2f}", "事件ID": event_id}
-                        )
-                        results["events"].append({
-                            "type": "region_exit",
-                            "level": "warning",
-                            "event_id": event_id,
-                            "photo_path": photo_path
-                        })
-                    # 更新状态，清空缓存
-                    self.last_in_region = False
-                    self.region_exit_start_time = None
-                    self.region_exit_candidate_photo = None
+                else:
+                    exit_dur = now - self.region_exit_start_time
+                    if exit_dur < self.region_exit_duration_threshold:
+                        # 防抖确认中：通知 UI 显示倒计时
+                        results["detections"]["region"]["exit_pending"] = True
+                        results["detections"]["region"]["exit_pending_s"] = exit_dur
+                    elif exit_dur >= self.region_exit_duration_threshold:
+                        # 确认后：用缓存的照片（状态刚变化时的那一帧）发送通知
+                        should_notify_exit = self.last_in_region is not False
+                        if should_notify_exit and self.region_exit_candidate_photo is not None:
+                            photo_path = self.storage.save_photo(self.region_exit_candidate_photo, now)
+                            event_id = self.storage.save_event(
+                                event_type="region_exit",
+                                level="warning",
+                                message="婴儿离开安全区域",
+                                details=region_features,
+                                photo_path=photo_path
+                            )
+                            self.notifier.send_alert(
+                                event_type="region_exit",
+                                level="warning",
+                                message="离开安全区域",
+                                photo_path=photo_path,
+                                details={"重叠比例": f"{body_overlap:.2f}", "事件ID": event_id}
+                            )
+                            results["events"].append({
+                                "type": "region_exit",
+                                "level": "warning",
+                                "event_id": event_id,
+                                "photo_path": photo_path
+                            })
+                        # 更新状态，清空缓存
+                        self.last_in_region = False
+                        self.region_exit_start_time = None
+                        self.region_exit_candidate_photo = None
 
             # 可能进入区域：检测到进入迹象 → 立即抓拍缓存 → 防抖确认
             elif confirmed_in:
@@ -1358,8 +1404,12 @@ class SleepSupervisor:
                     self.region_enter_candidate_photo = frame.copy()
                 elif now - self.region_enter_start_time >= self.region_exit_duration_threshold:
                     # 确认后：用缓存的照片（状态刚变化时的那一帧）发送通知
-                    if (self.last_in_region is None or self.last_in_region is False) \
+                    if self.last_in_region is None:
+                        # 启动后首次确认宝宝在安全区，只初始化状态，不发回区通知
+                        self.last_in_region = True
+                    elif self.last_in_region is False \
                             and self.region_enter_candidate_photo is not None:
+                        # 只有之前明确在区域外，才发送 region_enter
                         photo_path = self.storage.save_photo(self.region_enter_candidate_photo, now)
                         event_id = self.storage.save_event(
                             event_type="region_enter",
@@ -1381,8 +1431,8 @@ class SleepSupervisor:
                             "event_id": event_id,
                             "photo_path": photo_path
                         })
+                        self.last_in_region = True
                     # 更新状态，清空缓存
-                    self.last_in_region = True
                     self.region_enter_start_time = None
                     self.region_enter_candidate_photo = None
                     self.region_exit_start_time = None  # 进入后，离开计时器也重置
@@ -1391,6 +1441,44 @@ class SleepSupervisor:
             else:
                 self.region_exit_start_time = None
                 self.region_enter_start_time = None
+
+        # 🎙️ 纯音频快速通道：仅在当前帧判定离区时激活
+        # 单帧判定，不等防抖确认；区域内由融合通道处理，不抢冷却
+        if self.audio_enabled and audio_features \
+                and region_status == "out_of_region" \
+                and audio_features.cry_confidence >= self.audio_only_cry_threshold:
+            if self.audio_only_cry_start_time is None:
+                self.audio_only_cry_start_time = now
+            elif now - self.audio_only_cry_start_time >= self.audio_only_cry_duration \
+                    and self._should_alert("cry_detected"):
+                event_id = self.storage.save_event(
+                    event_type="cry_detected",
+                    level="danger",
+                    message=f"麦克风检测到高置信度哭声，音频置信度 {audio_features.cry_confidence:.2f}",
+                    details={"audio_confidence": audio_features.cry_confidence,
+                             "pattern_match": audio_features.cry_pattern_match,
+                             "volume": audio_features.rms_volume},
+                    photo_path=self.storage.save_photo(frame, now) if frame is not None else None
+                )
+                self.notifier.send_alert(
+                    event_type="cry_detected",
+                    level="danger",
+                    message="麦克风检测到婴儿哭声（离区音频通道）",
+                    photo_path=self.storage.save_photo(frame, now) if frame is not None else None,
+                    details={"音频置信度": f"{audio_features.cry_confidence:.2f}",
+                             "模式匹配": f"{audio_features.cry_pattern_match:.2f}",
+                             "音量": f"{audio_features.rms_volume:.3f}",
+                             "事件ID": event_id}
+                )
+                results["events"].append({
+                    "type": "cry_detected",
+                    "level": "danger",
+                    "source": "audio_only",
+                    "confidence": audio_features.cry_confidence,
+                    "event_id": event_id,
+                })
+        else:
+            self.audio_only_cry_start_time = None
 
         self.last_results = results
         return results, frame
