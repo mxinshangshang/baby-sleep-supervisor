@@ -37,7 +37,8 @@ class AudioCryDetector:
         # 时间平滑窗口
         self.volume_window = deque(maxlen=15)  # ~1.5秒
         self.pitch_window = deque(maxlen=10)
-        self.cry_confidence_window = deque(maxlen=8)
+        self.cry_confidence_window = deque(maxlen=20)  # 从8扩大到20，支持节律分析
+        self.confidence_timestamps = deque(maxlen=20)  # 记录每个置信度的时间
         self.audio_cry_start_time: Optional[float] = None
         self.last_cry_confidence = 0.0
 
@@ -216,12 +217,26 @@ class AudioCryDetector:
         # 时间平滑
         smoothed_confidence = self._get_smoothed_confidence(raw_confidence)
 
-        self.last_cry_confidence = smoothed_confidence
+        # ========== 节律特征增强 ==========
+        # 对「一声间隔一声」的典型婴儿哭声做针对性增强
+        rhythm_boost = self._compute_cry_rhythm_score()
+        rhythm_enhanced = min(1.0, smoothed_confidence * rhythm_boost)
+
+        # 只增强中间置信度区间：太低肯定不是，太高也没必要增强
+        # 重点解决：节律性哭声被平均稀释后置信度不够的问题
+        if 0.35 <= smoothed_confidence <= 0.8:
+            final_confidence = rhythm_enhanced
+        else:
+            final_confidence = smoothed_confidence
+
+        self.last_cry_confidence = final_confidence
         self.frame_count += 1
 
-        return smoothed_confidence, {
+        return final_confidence, {
             "raw_confidence": raw_confidence,
             "smoothed_confidence": smoothed_confidence,
+            "rhythm_boost": rhythm_boost,
+            "final_confidence": final_confidence,
             "features": features,
             "details": details
         }
@@ -230,6 +245,79 @@ class AudioCryDetector:
         """获取平滑后的置信度"""
         self.cry_confidence_window.append(new_confidence)
         return sum(self.cry_confidence_window) / len(self.cry_confidence_window)
+
+    def _compute_cry_rhythm_score(self) -> float:
+        """
+        计算哭声节律得分
+        婴儿哭声特征：一声间隔一声，0.5-2秒周期，重复性强
+        算法完全基于统计，O(1)开销，零延迟
+        """
+        window = list(self.cry_confidence_window)
+        if len(window) < 8:  # 需要至少4秒数据
+            return 1.0  # 数据不足时不做惩罚
+
+        # ========== 1. 峰值检测 ==========
+        peak_indices = []
+        peak_values = []
+        for i in range(1, len(window) - 1):
+            # 局部峰值：比左右都高，且绝对幅度足够
+            if window[i-1] < window[i] > window[i+1] and window[i] >= 0.4:
+                peak_indices.append(i)
+                peak_values.append(window[i])
+
+        peak_count = len(peak_indices)
+        if peak_count < 2:  # 峰值太少，无节律
+            return 1.0
+
+        # ========== 2. 峰值间隔规律性 ==========
+        # 每500ms一个采样点，典型间隔1-4个点（0.5-2秒）
+        peak_intervals = np.diff(peak_indices)
+        mean_interval = np.mean(peak_intervals)
+        std_interval = np.std(peak_intervals) if len(peak_intervals) > 1 else 999
+
+        # 间隔评分：1-3个点（0.5-1.5秒）最优
+        interval_score = 0.0
+        if 1.0 <= mean_interval <= 4.0:
+            interval_score = 1.0 - abs(mean_interval - 2.5) / 3.0
+            interval_score = max(0.3, interval_score)
+
+        # 间隔稳定性评分：标准差越小越规律
+        stability_score = 1.0 - min(1.0, std_interval / 2.0)
+        stability_score = max(0.4, stability_score)
+
+        # ========== 3. 占空比（哭-停-哭-停模式）==========
+        high_count = sum(1 for c in window if c >= 0.5)
+        duty_cycle = high_count / len(window)
+        # 典型哭声占空比：30-60%（有哭有停，不是连续也不是太少）
+        duty_cycle_score = 0.0
+        if 0.25 <= duty_cycle <= 0.75:
+            duty_cycle_score = 1.0 - abs(duty_cycle - 0.5) / 0.5
+            duty_cycle_score = max(0.5, duty_cycle_score)
+
+        # ========== 4. 峰值幅度一致性 ==========
+        peak_std = np.std(peak_values) if len(peak_values) > 1 else 0
+        peak_consistency_score = 1.0 - min(1.0, peak_std / 0.3)
+        peak_consistency_score = max(0.5, peak_consistency_score)
+
+        # ========== 5. 峰值频率（单位时间内的峰值数量）==========
+        # 10秒内有3-8个峰值是典型的哭声节律
+        peak_frequency = peak_count / len(window) * 20  # 归一化到10秒
+        frequency_score = 0.0
+        if 2.0 <= peak_frequency <= 10.0:
+            frequency_score = 1.0 - abs(peak_frequency - 5.0) / 5.0
+            frequency_score = max(0.4, frequency_score)
+
+        # ========== 融合节律增强因子 ==========
+        rhythm_weight = 0.4 * interval_score + \
+                        0.25 * stability_score + \
+                        0.15 * duty_cycle_score + \
+                        0.1 * peak_consistency_score + \
+                        0.1 * frequency_score
+
+        # 节律因子范围：0.7（无节律惩罚）~ 1.5（强节律大幅增强）
+        rhythm_boost = 0.7 + rhythm_weight * 0.8
+
+        return rhythm_boost
 
     def get_status(self) -> Dict:
         """获取状态"""
