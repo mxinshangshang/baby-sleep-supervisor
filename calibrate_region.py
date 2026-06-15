@@ -31,6 +31,7 @@ ALERT_OPTIONS = [
     ("occlusion_detected", "Face covered"),
     ("limb_exposure", "Left hand exposed"),
     ("region_exit", "Out of safe region"),
+    ("region_enter", "Enter safe region"),
 ]
 
 

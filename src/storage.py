@@ -55,6 +55,21 @@ class Storage:
             )
         ''')
 
+        # 创建维测事件表（调试/打点专用，不通知，不影响统计，不影响 events 表 ID 序列）
+        # 结构与 events 完全一致，方便 SQL join 分析
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS events_debug (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL,
+                details TEXT,
+                photo_path TEXT,
+                timestamp REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         # 创建统计表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS statistics (
@@ -75,6 +90,48 @@ class Storage:
 
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _jsonable(obj):
+        """递归把含 numpy / tuple 的对象转成 json 可序列化的形式。"""
+        try:
+            import numpy as _np
+        except Exception:
+            _np = None
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return {str(k): Storage._jsonable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [Storage._jsonable(v) for v in obj]
+        if _np is not None and isinstance(obj, (_np.bool_,)):
+            return bool(obj)
+        if _np is not None and isinstance(obj, _np.integer):
+            return int(obj)
+        if _np is not None and isinstance(obj, _np.floating):
+            f = float(obj)
+            return f if (f == f and f not in (float("inf"), float("-inf"))) else None
+        if isinstance(obj, float):
+            return obj if (obj == obj and obj not in (float("inf"), float("-inf"))) else None
+        if isinstance(obj, (int, str, bool)):
+            return obj
+        try:
+            return str(obj)
+        except Exception:
+            return None
+
+    def _serialize_details(self, details) -> str:
+        """把 details 写入 DB 前序列化。优先 JSON，失败回退 str()（保持向后兼容）。"""
+        if details is None:
+            return None
+        try:
+            import json
+            return json.dumps(self._jsonable(details), ensure_ascii=False)
+        except Exception:
+            try:
+                return str(details)
+            except Exception:
+                return None
 
     def save_photo(self, frame, timestamp: float = None) -> Optional[str]:
         """保存抓拍照片
@@ -101,12 +158,17 @@ class Storage:
             return None
 
     def save_event(self, event_type: str, level: str, message: str,
-                   details: Optional[Dict] = None, photo_path: Optional[str] = None) -> int:
+                   details: Optional[Dict] = None, photo_path: Optional[str] = None,
+                   update_stats: bool = True) -> int:
         """保存事件到数据库
         返回事件ID
+
+        update_stats: 是否更新 statistics 表与触发清理。
+                      调试/维测打点设为 False，避免污染日统计。
         """
         timestamp = time.time()
-        details_str = str(details) if details else None
+        # 序列化 details：尽量用 JSON（便于事后查询/解析），失败时回退 str()
+        details_str = self._serialize_details(details) if details else None
 
         conn = sqlite3.connect(self.sqlite_path)
         cursor = conn.cursor()
@@ -119,59 +181,60 @@ class Storage:
 
             event_id = cursor.lastrowid
 
-            # 更新统计
-            date_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
-            cursor.execute('SELECT id FROM statistics WHERE date = ?', (date_str,))
-            if cursor.fetchone():
-                # 更新现有统计
-                update_fields = {
-                    "total_events": "total_events + 1",
-                    f"{level}_count": f"{level}_count + 1"
-                }
+            if update_stats:
+                # 更新统计
+                date_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+                cursor.execute('SELECT id FROM statistics WHERE date = ?', (date_str,))
+                if cursor.fetchone():
+                    # 更新现有统计
+                    update_fields = {
+                        "total_events": "total_events + 1",
+                        f"{level}_count": f"{level}_count + 1"
+                    }
 
-                # 特定事件计数
-                if event_type == "cry_detected":
-                    update_fields["cry_count"] = "cry_count + 1"
-                elif event_type == "limb_exposure":
-                    update_fields["exposure_count"] = "exposure_count + 1"
-                elif event_type == "occlusion_detected":
-                    update_fields["occlusion_count"] = "occlusion_count + 1"
-                elif event_type == "region_exit":
-                    update_fields["region_exit_count"] = "region_exit_count + 1"
+                    # 特定事件计数
+                    if event_type == "cry_detected":
+                        update_fields["cry_count"] = "cry_count + 1"
+                    elif event_type == "limb_exposure":
+                        update_fields["exposure_count"] = "exposure_count + 1"
+                    elif event_type == "occlusion_detected":
+                        update_fields["occlusion_count"] = "occlusion_count + 1"
+                    elif event_type == "region_exit":
+                        update_fields["region_exit_count"] = "region_exit_count + 1"
 
-                set_clause = ", ".join([f"{k} = {v}" for k, v in update_fields.items()])
-                cursor.execute(f'''
-                    UPDATE statistics SET {set_clause}, updated_at = CURRENT_TIMESTAMP
-                    WHERE date = ?
-                ''', (date_str,))
-            else:
-                # 新建统计记录
-                counts = {
-                    "notice_count": 1 if level == "notice" else 0,
-                    "warning_count": 1 if level == "warning" else 0,
-                    "danger_count": 1 if level == "danger" else 0,
-                    "cry_count": 1 if event_type == "cry_detected" else 0,
-                    "exposure_count": 1 if event_type == "limb_exposure" else 0,
-                    "occlusion_count": 1 if event_type == "occlusion_detected" else 0,
-                    "region_exit_count": 1 if event_type == "region_exit" else 0,
-                }
+                    set_clause = ", ".join([f"{k} = {v}" for k, v in update_fields.items()])
+                    cursor.execute(f'''
+                        UPDATE statistics SET {set_clause}, updated_at = CURRENT_TIMESTAMP
+                        WHERE date = ?
+                    ''', (date_str,))
+                else:
+                    # 新建统计记录
+                    counts = {
+                        "notice_count": 1 if level == "notice" else 0,
+                        "warning_count": 1 if level == "warning" else 0,
+                        "danger_count": 1 if level == "danger" else 0,
+                        "cry_count": 1 if event_type == "cry_detected" else 0,
+                        "exposure_count": 1 if event_type == "limb_exposure" else 0,
+                        "occlusion_count": 1 if event_type == "occlusion_detected" else 0,
+                        "region_exit_count": 1 if event_type == "region_exit" else 0,
+                    }
 
-                cursor.execute('''
-                    INSERT INTO statistics (
-                        date, total_events, notice_count, warning_count, danger_count,
-                        cry_count, exposure_count, occlusion_count, region_exit_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    date_str, 1,
-                    counts["notice_count"], counts["warning_count"], counts["danger_count"],
-                    counts["cry_count"], counts["exposure_count"],
-                    counts["occlusion_count"], counts["region_exit_count"]
-                ))
+                    cursor.execute('''
+                        INSERT INTO statistics (
+                            date, total_events, notice_count, warning_count, danger_count,
+                            cry_count, exposure_count, occlusion_count, region_exit_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        date_str, 1,
+                        counts["notice_count"], counts["warning_count"], counts["danger_count"],
+                        counts["cry_count"], counts["exposure_count"],
+                        counts["occlusion_count"], counts["region_exit_count"]
+                    ))
 
             conn.commit()
 
-            # 定期清理旧数据
-            if self.auto_cleanup_enabled and time.time() - self.last_cleanup_time > self.cleanup_interval:
+            # 定期清理旧数据（仅在更新统计的路径触发，避免高频维测打点反复清理）
+            if update_stats and self.auto_cleanup_enabled and time.time() - self.last_cleanup_time > self.cleanup_interval:
                 self._cleanup_old_data()
                 self.last_cleanup_time = time.time()
 
@@ -235,6 +298,34 @@ class Storage:
             conn.rollback()
         finally:
             conn.close()
+
+    def save_debug_event(self, event_type: str, level: str, message: str,
+                         details: Optional[Dict] = None, photo_path: Optional[str] = None) -> int:
+        """保存维测打点事件到 events_debug 表。
+        - 不影响 events 表的 ID 序列
+        - 不更新 statistics
+        - 不触发清理
+        - 不发通知
+        专门用于 region_debug / 算法中间值记录，便于事后定位误报。
+        """
+        timestamp = time.time()
+        details_str = self._serialize_details(details) if details else None
+
+        conn = sqlite3.connect(self.sqlite_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO events_debug (event_type, level, message, details, photo_path, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (event_type, level, message, details_str, photo_path, timestamp))
+            event_id = cursor.lastrowid
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return event_id
 
     def get_events(self, start_time: float = None, end_time: float = None,
                    level: str = None, event_type: str = None, limit: int = 100) -> List[Dict]:

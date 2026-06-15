@@ -1000,25 +1000,40 @@ class SleepSupervisor:
                     elif now - self.cry_start_time >= self.cry_duration_threshold and self._should_alert("cry_detected"):
                         photo_path = self.storage.save_photo(frame, now)
                         level = "warning" if smoothed_cry < 0.85 else "danger"
+                        # 报警时附带音频状态信息（P0 节律检测版）
+                        audio_info = {}
+                        if audio_features:
+                            audio_info = {
+                                "音频综合分": f"{audio_features.cry_confidence:.2f}",
+                                "声学分": f"{audio_features.acoustic_confidence:.2f}",
+                                "节律分": f"{audio_features.rhythm_score:.2f}",
+                                "音量": f"{audio_features.rms_volume:.3f}",
+                                "连续爆发": f"{audio_features.burst_count}次",
+                                "平均间隔": f"{audio_features.avg_interval_s:.2f}s",
+                                "模式匹配": f"{audio_features.cry_pattern_match:.1%}",
+                                "是否检测到哭声": "是" if audio_features.is_crying else "否"
+                            }
                         event_id = self.storage.save_event(
                             event_type="cry_detected",
                             level=level,
                             message=f"检测到婴儿哭闹，融合置信度 {smoothed_cry:.2f}",
-                            details=cry_features,
+                            details={**cry_features, **audio_info},
                             photo_path=photo_path
                         )
+                        alert_details = {
+                            "融合置信度": f"{smoothed_cry:.2f}",
+                            "表情原始分": f"{expression_confidence:.2f}",
+                            "动作躁动": f"{motion_features.get('agitation', 0.0):.2f}",
+                            "脸朝向": str(fusion_features.get("face_orientation")),
+                            "事件ID": event_id,
+                            **audio_info
+                        }
                         self.notifier.send_alert(
                             event_type="cry_detected",
                             level=level,
                             message="婴儿哭闹",
                             photo_path=photo_path,
-                            details={
-                                "融合置信度": f"{smoothed_cry:.2f}",
-                                "表情原始分": f"{expression_confidence:.2f}",
-                                "动作躁动": f"{motion_features.get('agitation', 0.0):.2f}",
-                                "脸朝向": str(fusion_features.get("face_orientation")),
-                                "事件ID": event_id,
-                            }
+                            details=alert_details
                         )
                         results["events"].append({
                             "type": "cry_detected",
@@ -1079,16 +1094,11 @@ class SleepSupervisor:
         if self.occlusion_enabled:
             if presence["confirmed"]:
                 if landmarks is not None:
+                    # 通用遮挡检测：检测任何物体（手/被子/玩具/枕头/衣物等）
+                    # 不再需要单独的手部检测分支，简化逻辑
                     occlusion_confidence, occlusion_features = self.face_detector.detect_occlusion(frame, landmarks)
-                    # With FaceMesh available, only an explicit hand/occluder overlapping the exact
-                    # mouth-nose ROI is allowed to raise the score above the conservative visual cap.
-                    hand_conf, hand_features = self.face_detector.score_hands_against_roi(
-                        occlusion_features.get("roi_bbox"), hands
-                    )
-                    if hand_conf > occlusion_confidence:
-                        occlusion_confidence = hand_conf
-                        occlusion_features.update(hand_features)
                 else:
+                    # landmarks 不可用（侧脸/遮挡严重）→ 降级用头部 ROI 检测
                     occlusion_confidence, occlusion_features = self.face_detector.detect_head_occlusion_fallback(frame, pose_summary.get("head_bbox"), hands)
 
                 smoothed_occlusion = self._get_smoothed_value(self.occlusion_confidence_window, occlusion_confidence)
