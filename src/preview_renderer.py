@@ -278,13 +278,13 @@ class PreviewRenderer:
             # Only draw body bbox on abnormal states (out_of_region / uncertain)
             # to avoid visual confusion with the green Safe Region overlay when in_region.
             if features.get("body_bbox") and status != "in_region":
-                x1, y1, x2, y2 = features["body_bbox"]
+                x1, y1, x2, y2 = [int(v) for v in features["body_bbox"]]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             if features.get("torso_bbox"):
-                x1, y1, x2, y2 = features["torso_bbox"]
+                x1, y1, x2, y2 = [int(v) for v in features["torso_bbox"]]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), self.COLORS["torso"], 2)
             if features.get("head_bbox"):
-                x1, y1, x2, y2 = features["head_bbox"]
+                x1, y1, x2, y2 = [int(v) for v in features["head_bbox"]]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), self.COLORS["head"], 2)
 
         return frame
