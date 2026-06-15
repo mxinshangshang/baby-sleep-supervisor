@@ -26,10 +26,15 @@ class AudioFeatures:
     """音频特征输出（传给主进程的唯一数据结构）"""
     timestamp: float
     rms_volume: float
-    cry_confidence: float        # 综合哭声置信度
-    cry_pattern_match: float     # 哭声模式匹配度
+    cry_confidence: float        # 综合哭声置信度（声学分+节律分，各50%）
+    cry_pattern_match: float     # 哭声模式匹配度（声学特征满足度）
     is_crying: bool
     processing_latency_ms: float # 处理延迟（监控用）
+    # ===== P0 节律检测新增字段 =====
+    rhythm_score: float = 0.0      # 节律评分（0-1.0，哭声节律匹配度
+    burst_count: int = 0        # 连续哭声爆发次数
+    avg_interval_s: float = 0.0    # 平均周期间隔（秒）
+    acoustic_confidence: float = 0.0  # 纯声学分（不含节律）
 
 
 # ==================== 哭声检测器（轻量版） ====================
@@ -51,9 +56,71 @@ class LightweightCryDetector:
         self.centroid_min = 500 # Hz，扩大范围
         self.centroid_max = 4000 # Hz，扩大范围
 
+        # 降噪参数
+        self.noise_reduction_enabled = True
+        self.powerline_freq = 50  # 中国电源频率50Hz
+        self.highpass_cutoff = 200  # 高通滤波截止频率，去除低频噪音
+
         # 平滑窗口
         self.confidence_window = []
         self.window_size = 3
+
+        # ============= P0：音频节律检测新增 =============
+        # 哭声节律的科学统计范围（儿科声学研究）
+        # 典型周期：0.5~1.2秒（哭+吸气停顿）
+        # 连续爆发：至少3个周期才算真哭
+        self.rhythm_min_interval_s = 0.4    # 最快间隔
+        self.rhythm_max_interval_s = 1.3    # 最慢间隔
+        self.rhythm_min_bursts = 3          # 最少连续爆发次数
+
+        # 历史数据（每500ms一帧，24帧=12秒历史）
+        self.volume_history = []
+        self.timestamp_history = []
+        self.peak_history = []  # 音量峰值时间戳
+        self.max_history_frames = 24  # 12秒历史，足够分析节律
+
+        # 节律检测状态
+        self.last_peak_timestamp = 0.0
+        self.consecutive_cry_bursts = 0  # 连续符合节律的爆发计数
+
+    def _apply_noise_reduction(self, audio: np.ndarray) -> np.ndarray:
+        """
+        应用数字降噪：50Hz电源陷波 + 200Hz高通滤波
+        专门去除空调/风扇等低频环境噪音
+        """
+        if not self.noise_reduction_enabled:
+            return audio
+
+        n = len(audio)
+        # FFT 变换到频域
+        fft_vals = np.fft.rfft(audio * np.hanning(n))
+        fft_freqs = np.fft.rfftfreq(n, 1.0 / self.sample_rate)
+
+        # ========== 50Hz电源陷波滤波器 ==========
+        # 去除50Hz及其谐波（100Hz, 150Hz, 200Hz...）
+        for harmonic in range(1, 5):  # 1-4次谐波
+            target_freq = self.powerline_freq * harmonic
+            # 在目标频率周围创建一个小陷波带（±5Hz）
+            notch_mask = (fft_freqs >= target_freq - 5) & (fft_freqs <= target_freq + 5)
+            fft_vals[notch_mask] *= 0.05  # 衰减95%
+
+        # ========== 200Hz高通滤波器 ==========
+        # 去除低于200Hz的低频噪音（主要是电机、风扇的低频嗡嗡声）
+        low_freq_mask = fft_freqs < self.highpass_cutoff
+        # 创建渐变衰减，避免陡峭截止的振铃效应
+        fade_width = 50  # 50Hz渐变区间
+        for i, freq in enumerate(fft_freqs):
+            if freq < self.highpass_cutoff - fade_width:
+                fft_vals[i] *= 0.01  # 完全衰减
+            elif freq < self.highpass_cutoff:
+                # 线性渐变：从100%衰减到0%
+                fade_ratio = (self.highpass_cutoff - freq) / fade_width
+                fft_vals[i] *= (1.0 - fade_ratio * 0.99)
+
+        # 频域处理完成，反变换回时域
+        cleaned_audio = np.fft.irfft(fft_vals)
+
+        return cleaned_audio
 
     def _compute_rms(self, audio: np.ndarray) -> float:
         """计算RMS音量"""
@@ -97,37 +164,101 @@ class LightweightCryDetector:
             return {'centroid': 0, 'pitch': 0, 'hf_ratio': 0}
 
     def process_frame(self, audio: np.ndarray) -> AudioFeatures:
-        """处理一帧音频，返回哭声特征"""
+        """处理一帧音频，返回哭声特征（含 P0 节律检测）"""
         start_time = time.time()
+        current_timestamp = time.time()
 
+        # ========== 先进行数字降噪 ==========
+        cleaned_audio = self._apply_noise_reduction(audio)
+
+        # ✅ Bug 修复：RMS 音量用原始信号计算，避免汉宁窗+滤波导致的能量衰减（3-7倍）
+        # 降噪后的信号仍用于频谱特征分析（去除低频噪音影响频谱质心等）
         volume = self._compute_rms(audio)
-        spectral = self._compute_spectral_features(audio)
+        spectral = self._compute_spectral_features(cleaned_audio)
 
-        # ========== 多特征加权置信度 ==========
-        confidence = 0.0
+        # ========== 1. 基础声学特征置信度 ==========
+        acoustic_confidence = 0.0
 
         # 1. 音量权重 (35%)
         if volume > self.volume_threshold:
-            volume_score = min(1.0, volume / 0.25)
-            confidence += volume_score * 0.35
+            volume_score = min(1.0, volume / 0.10)  # 0.10归一化（家用环境响亮哭声RMS约0.07-0.15）
+            acoustic_confidence += volume_score * 0.35
 
         # 2. 基频权重 (25%)
         if self.pitch_min <= spectral['pitch'] <= self.pitch_max:
             pitch_score = 1.0 - abs(spectral['pitch'] - 650) / 600
-            confidence += max(0, pitch_score) * 0.25
+            acoustic_confidence += max(0, pitch_score) * 0.25
 
         # 3. 频谱质心权重 (25%)
         if self.centroid_min <= spectral['centroid'] <= self.centroid_max:
             centroid_score = 1.0 - abs(spectral['centroid'] - 1800) / 1500
-            confidence += max(0, centroid_score) * 0.25
+            acoustic_confidence += max(0, centroid_score) * 0.25
 
         # 4. 高频占比权重 (15%)
         if 0.25 <= spectral['hf_ratio'] <= 0.7:
             hf_score = 1.0 - abs(spectral['hf_ratio'] - 0.45) / 0.35
-            confidence += max(0, hf_score) * 0.15
+            acoustic_confidence += max(0, hf_score) * 0.15
+
+        # ========== 2. P0 节律检测（新增，性能开销可忽略） ==========
+        rhythm_score = 0.0
+        burst_count = 0
+        avg_interval_s = 0.0
+
+        # 更新历史数据
+        self.volume_history.append(volume)
+        self.timestamp_history.append(current_timestamp)
+        if len(self.volume_history) > self.max_history_frames:
+            self.volume_history.pop(0)
+            self.timestamp_history.pop(0)
+
+        # 检测音量峰值（哭声爆发点）：简单有效，性能零开销
+        if len(self.volume_history) >= 3:
+            # 当前帧是局部峰值（比前后都高且超过阈值）
+            is_peak = (
+                self.volume_history[-2] > self.volume_threshold * 1.5  # 峰值本身够大
+                and self.volume_history[-2] > self.volume_history[-3]
+                and self.volume_history[-2] > self.volume_history[-1]
+            )
+            if is_peak:
+                peak_time = self.timestamp_history[-2]
+                self.peak_history.append(peak_time)
+
+                # 分析峰值间隔：是否符合 0.4~1.3s 的哭声典型节律
+                if len(self.peak_history) >= 2:
+                    # 只分析最近的峰值
+                    recent_peaks = self.peak_history[-8:]  # 最近8个峰值 = ~4-10秒
+                    intervals = []
+                    for i in range(1, len(recent_peaks)):
+                        interval = recent_peaks[i] - recent_peaks[i-1]
+                        intervals.append(interval)
+
+                    if intervals:
+                        # 计算符合节律范围的间隔比例
+                        valid_intervals = [
+                            i for i in intervals
+                            if self.rhythm_min_interval_s <= i <= self.rhythm_max_interval_s
+                        ]
+                        rhythm_ratio = len(valid_intervals) / len(intervals) if intervals else 0.0
+                        burst_count = len(valid_intervals) + 1
+
+                        # 节律评分：比例 × 连续爆发次数加成
+                        # 连续爆发越多，分数越高（真哭不会只哭一声）
+                        burst_bonus = min(1.0, burst_count / 4.0)  # 4次以上给满分
+                        rhythm_score = rhythm_ratio * 0.6 + burst_bonus * 0.4
+
+                        avg_interval_s = sum(valid_intervals) / len(valid_intervals) if valid_intervals else 0.0
+
+                # 清理过旧的峰值记录（只保留最近15秒）
+                cutoff_time = current_timestamp - 15.0
+                self.peak_history = [p for p in self.peak_history if p > cutoff_time]
+
+        # ========== 3. 置信度融合（核心改进！） ==========
+        # 50% 声学特征 + 50% 节律特征
+        # 只有声学+节律双高，才算真哭！
+        final_confidence = 0.5 * acoustic_confidence + 0.5 * rhythm_score
 
         # 时间平滑
-        self.confidence_window.append(confidence)
+        self.confidence_window.append(final_confidence)
         if len(self.confidence_window) > self.window_size:
             self.confidence_window.pop(0)
         smoothed_confidence = sum(self.confidence_window) / len(self.confidence_window)
@@ -145,12 +276,17 @@ class LightweightCryDetector:
         latency_ms = (time.time() - start_time) * 1000
 
         return AudioFeatures(
-            timestamp=time.time(),
+            timestamp=current_timestamp,
             rms_volume=float(volume),
             cry_confidence=float(smoothed_confidence),
             cry_pattern_match=float(pattern_match),
             is_crying=bool(smoothed_confidence >= 0.5),
-            processing_latency_ms=float(latency_ms)
+            processing_latency_ms=float(latency_ms),
+            # ===== P0 新增字段，用于调试展示 =====
+            rhythm_score=float(rhythm_score),
+            burst_count=int(burst_count),
+            avg_interval_s=float(avg_interval_s),
+            acoustic_confidence=float(acoustic_confidence),
         )
 
 
