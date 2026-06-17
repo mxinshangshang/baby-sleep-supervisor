@@ -83,7 +83,9 @@ class SleepSupervisor:
         self.cry_start_time: Optional[float] = None
         self.audio_only_cry_start_time: Optional[float] = None
         self.exposure_start_time: Optional[float] = None
-        self.occlusion_start_time: Optional[float] = None
+        # 【专业重构】帧计数为主，超时看门狗为辅
+        self.occlusion_consecutive_frames: int = 0
+        self.occlusion_last_ok_time: float = 0.0
         self.region_exit_start_time: Optional[float] = None
         self.region_enter_start_time: Optional[float] = None
         self.face_absence_start_time: Optional[float] = None
@@ -963,6 +965,25 @@ class SleepSupervisor:
                 "gateway_healthy": self.audio_gateway.is_healthy() if self.audio_enabled else False
             }
 
+            # 🔍 音频维测：每30帧=10秒打点一次，旁路记录不影响主流程（调试完成后可移除）
+            if self.frame_count % 30 == 0 and self.storage:
+                self.storage.save_event(
+                    event_type="audio_heartbeat",
+                    level="debug",
+                    message=f"音量:{audio_features.rms_volume:.3f} 置信度:{audio_features.cry_confidence:.2f}",
+                    details={
+                        "volume": float(audio_features.rms_volume),
+                        "cry_confidence": float(audio_features.cry_confidence),
+                        "acoustic_confidence": float(audio_features.acoustic_confidence),
+                        "rhythm_score": float(audio_features.rhythm_score),
+                        "burst_count": int(audio_features.burst_count),
+                        "pattern_match": float(audio_features.cry_pattern_match),
+                        "is_crying": bool(audio_features.is_crying)
+                    },
+                    update_stats=False,
+                    to_debug_table=True  # ✅ 写入维测表，不占用 events 表ID
+                )
+
         if self.cry_enabled:
             if landmarks is not None and presence["confirmed"]:
                 expression_confidence, cry_features = self.face_detector.detect_cry_expression(landmarks)
@@ -1109,39 +1130,51 @@ class SleepSupervisor:
                     "reason": occlusion_features.get("reason"),
                     "features": occlusion_features
                 }
+                # 【专业重构】帧计数为主 + 超时看门狗
+                # 触发：连续4帧满足（≈2秒），且无异常慢帧
+                # 清零：连续2帧不满足 或 超时2秒（防帧卡死）
                 if smoothed_occlusion >= self.occlusion_threshold and occlusion_confidence >= 0.5:
-                    if self.occlusion_start_time is None:
-                        self.occlusion_start_time = now
-                    elif now - self.occlusion_start_time >= self.occlusion_duration_threshold and self._should_alert("occlusion_detected"):
-                        photo_path = self.storage.save_photo(frame, now)
-                        event_id = self.storage.save_event(
-                            event_type="occlusion_detected",
-                            level="danger",
-                            message=f"检测到口鼻/头脸遮挡风险，置信度 {smoothed_occlusion:.2f}",
-                            details=occlusion_features,
-                            photo_path=photo_path
-                        )
-                        self.notifier.send_alert(
-                            event_type="occlusion_detected",
-                            level="danger",
-                            message="口鼻/头脸遮挡风险",
-                            photo_path=photo_path,
-                            details={"置信度": f"{smoothed_occlusion:.2f}", "原因": str(occlusion_features.get("reason")), "事件ID": event_id}
-                        )
-                        # 【修复2】移除遮挡时的配对哭闹通知
-                        # 原逻辑：只要有遮挡且FaceMesh不可用，就额外发送哭闹通知 → 导致大量误报
-                        # 修改后：只发送遮挡通知，不附带哭闹误报
-                        results["events"].append({
-                            "type": "occlusion_detected",
-                            "level": "danger",
-                            "confidence": smoothed_occlusion,
-                            "event_id": event_id,
-                            "photo_path": photo_path
-                        })
+                    self.occlusion_consecutive_frames += 1
+                    self.occlusion_last_ok_time = now
                 else:
-                    self.occlusion_start_time = None
+                    # 连续帧衰减（不是立刻清零），允许中间1帧波动
+                    self.occlusion_consecutive_frames = max(0, self.occlusion_consecutive_frames - 1)
+                
+                # 超时看门狗：防止帧卡死/推理异常慢
+                if now - self.occlusion_last_ok_time > 2.0:
+                    self.occlusion_consecutive_frames = 0
+                
+                # 双重条件触发告警
+                if (self.occlusion_consecutive_frames >= 4  # 连续4帧≈2秒
+                    and (now - self.occlusion_last_ok_time) < 3.0  # 超时保护，异常慢帧不触发
+                    and self._should_alert("occlusion_detected")):
+                    
+                    photo_path = self.storage.save_photo(frame, now)
+                    event_id = self.storage.save_event(
+                        event_type="occlusion_detected",
+                        level="danger",
+                        message=f"检测到口鼻/头脸遮挡风险，置信度 {smoothed_occlusion:.2f}",
+                        details=occlusion_features,
+                        photo_path=photo_path
+                    )
+                    self.notifier.send_alert(
+                        event_type="occlusion_detected",
+                        level="danger",
+                        message="口鼻/头脸遮挡风险",
+                        photo_path=photo_path,
+                        details={"置信度": f"{smoothed_occlusion:.2f}", "原因": str(occlusion_features.get("reason")), "事件ID": event_id}
+                    )
+                    results["events"].append({
+                        "type": "occlusion_detected",
+                        "level": "danger",
+                        "confidence": smoothed_occlusion,
+                        "event_id": event_id,
+                        "photo_path": photo_path
+                    })
             else:
-                self.occlusion_start_time = None
+                # presence未确认时直接重置
+                self.occlusion_consecutive_frames = 0
+                self.occlusion_last_ok_time = 0
                 results["detections"]["occlusion"] = {
                     "confidence": 0.0,
                     "status": "unavailable",
@@ -1251,6 +1284,8 @@ class SleepSupervisor:
                 }
 
         region_status = "region_disabled"  # 兜底值，区域检测关闭时使用
+        face_bbox = face_summary.get("main_face_bbox")  # 在条件块外部定义，避免未定义错误
+        face_center_in_region = False  # 在条件块外部定义，避免未定义错误
         if self.region_enabled:
             in_region = False  # 默认为不在区域内，有人且满足条件才设为 True
             region_status = "no_confirmed_person" if not presence["confirmed"] else "uncertain"
@@ -1280,27 +1315,48 @@ class SleepSupervisor:
                 if head_center:
                     head_center_in_region = self.region_detector.point_in_region(head_center)
 
-                # 【修复1】收紧区域判定逻辑：要求身体的主要部分在安全区域内
-                # 不再因为"只有头在区域内"或"只有躯干中心在区域内"就判定在区域内
-                # 必须满足：躯干和身体都有足够的重叠比例
-                # 从配置派生阈值，替代硬编码值
+                # 【区域判定逻辑：人脸+姿态互相佐证】
+                # 设计原则：人脸是最强锚点，姿态检测作为补充和佐证
+                # 避免单一检测漂移导致误判
                 body_thr = self.region_body_overlap_threshold
                 torso_thr = self.region_torso_overlap_threshold
-                body_loose_thr = max(0.35, body_thr - 0.10)
-                torso_loose_thr = max(0.35, torso_thr - 0.05)
+                body_loose_thr = max(0.20, body_thr - 0.15)
+                torso_loose_thr = max(0.20, torso_thr - 0.15)
 
-                if torso_overlap >= torso_thr and body_overlap >= body_thr:
+                # 优先级1：人脸中心在区域内 → 最强证据，直接判定在区域内
+                face_center = self._bbox_center(face_bbox) if face_bbox else None
+                if face_center:
+                    face_center_in_region = self.region_detector.point_in_region(face_center)
+                if face_center_in_region:
+                    in_region = True
+                    region_status = "in_region"
+                    decision_basis = "face_center_in_region"
+
+                # 优先级2：头框中心在区域内 + 至少有少量重叠 → 姿态辅助佐证
+                elif head_center_in_region and (body_overlap >= 0.20 or torso_overlap >= 0.20):
+                    in_region = True
+                    region_status = "in_region"
+                    decision_basis = "head_center_in_region_with_overlap"
+
+                # 优先级3：标准的躯干+身体双重阈值判断
+                elif torso_overlap >= torso_thr and body_overlap >= body_thr:
                     in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_and_body_overlap"
+
+                # 优先级4：躯干中心 + 宽松身体重叠
                 elif torso_center_in_region and body_overlap >= body_loose_thr:
                     in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_center_plus_body"
+
+                # 优先级5：躯干重叠 + 身体中心在区域内
                 elif torso_overlap >= torso_loose_thr and body_center_in_region:
                     in_region = True
                     region_status = "in_region"
                     decision_basis = "torso_overlap_plus_center"
+
+                # 以上都不满足 → 才判定离开
                 else:
                     in_region = False
                     region_status = "out_of_region"
@@ -1312,11 +1368,13 @@ class SleepSupervisor:
                 "body_bbox": pose_summary.get("body_bbox"),
                 "torso_bbox": pose_summary.get("torso_bbox"),
                 "head_bbox": pose_summary.get("head_bbox") or face_summary.get("main_face_bbox"),
+                "face_bbox": face_bbox,
                 "body_overlap_ratio": body_overlap,
                 "torso_overlap_ratio": torso_overlap,
                 "body_center_in_region": body_center_in_region,
                 "torso_center_in_region": torso_center_in_region,
                 "head_center_in_region": head_center_in_region,
+                "face_center_in_region": face_center_in_region,
                 "decision_basis": decision_basis,
                 "visible_landmarks": pose_summary.get("visible_landmarks", 0),
                 "core_landmarks": pose_summary.get("core_landmarks", 0),
@@ -1343,7 +1401,7 @@ class SleepSupervisor:
             confirmed_in = (
                 presence["confirmed"]
                 and region_status == "in_region"
-                and exit_ratio <= 0.3
+                and exit_ratio <= 0.5  # 【对称修复】进入和离开门槛一致
                 and torso_overlap >= 0.3  # 进入区域必须有至少30%躯干在床内，防止只伸手进去误判
             )
 
@@ -1501,7 +1559,7 @@ class SleepSupervisor:
             "last_events": self.last_results.get("events", []),
             "has_cry": self.cry_start_time is not None or self.distress_start_time is not None,
             "has_exposure": self.exposure_start_time is not None,
-            "has_occlusion": self.occlusion_start_time is not None,
+            "has_occlusion": self.occlusion_consecutive_frames > 0,
             "has_region_exit": self.region_exit_start_time is not None,
             "has_face_absence": self.face_absence_start_time is not None,
             "has_prone": self.prone_start_time is not None,

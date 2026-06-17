@@ -159,12 +159,14 @@ class Storage:
 
     def save_event(self, event_type: str, level: str, message: str,
                    details: Optional[Dict] = None, photo_path: Optional[str] = None,
-                   update_stats: bool = True) -> int:
+                   update_stats: bool = True, to_debug_table: bool = False) -> int:
         """保存事件到数据库
         返回事件ID
 
         update_stats: 是否更新 statistics 表与触发清理。
                       调试/维测打点设为 False，避免污染日统计。
+        to_debug_table: 写入 events_debug 维测表（不占用 events 表ID序列）。
+                        用于 audio_heartbeat 等频繁打点的维测数据。
         """
         timestamp = time.time()
         # 序列化 details：尽量用 JSON（便于事后查询/解析），失败时回退 str()
@@ -173,9 +175,11 @@ class Storage:
         conn = sqlite3.connect(self.sqlite_path)
         cursor = conn.cursor()
 
+        table_name = "events_debug" if to_debug_table else "events"
+
         try:
-            cursor.execute('''
-                INSERT INTO events (event_type, level, message, details, photo_path, timestamp)
+            cursor.execute(f'''
+                INSERT INTO {table_name} (event_type, level, message, details, photo_path, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (event_type, level, message, details_str, photo_path, timestamp))
 
