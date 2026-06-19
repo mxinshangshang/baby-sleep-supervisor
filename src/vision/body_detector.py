@@ -149,6 +149,61 @@ class BodyDetector:
 
         return exposure_ratio, features
 
+    def detect_limb_exposure_simple(self, frame: np.ndarray, baby_topology: Dict) -> Tuple[float, Dict]:
+        """降级模式：盖被子/侧脸场景的简单肢体裸露检测
+        不需要完整 pose，只基于 bbox 和肤色检测
+        """
+        h, w, _ = frame.shape
+        head_bbox = baby_topology.get("head_bbox")
+        body_bbox = baby_topology.get("body_bbox")
+
+        if not head_bbox and not body_bbox:
+            return 0.0, {"reason": "no_bbox_detected"}
+
+        # 使用检测到的 bbox 作为感兴趣区域
+        if body_bbox:
+            x1, y1, x2, y2 = body_bbox
+        elif head_bbox:
+            # 只有头的话，扩大范围检测下方区域可能露出的手脚
+            hx1, hy1, hx2, hy2 = head_bbox
+            head_h = hy2 - hy1
+            x1, y1, x2, y2 = max(0, hx1 - head_h), max(0, hy1 - head_h), min(w, hx2 + head_h), min(h, hy2 + head_h * 3)
+        else:
+            return 0.0, {"reason": "no_valid_bbox"}
+
+        # 边界保护
+        x1, y1, x2, y2 = int(max(0, x1)), int(max(0, y1)), int(min(w, x2)), int(min(h, y2))
+        if x2 - x1 < 20 or y2 - y1 < 20:
+            return 0.0, {"reason": "bbox_too_small"}
+
+        # 在 ROI 内检测肤色
+        roi = frame[y1:y2, x1:x2]
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        skin_mask = cv2.inRange(hsv_roi, self.lower_skin, self.upper_skin)
+
+        skin_pixels = np.sum(skin_mask > 0)
+        total_pixels = (y2 - y1) * (x2 - x1)
+        exposure_ratio = skin_pixels / (total_pixels + 1e-6)
+
+        features = {
+            "exposure_ratio": float(exposure_ratio),
+            "skin_pixels": int(skin_pixels),
+            "roi_pixels": int(total_pixels),
+            "detection_mode": "simple_bbox_skin",
+            "has_head_bbox": head_bbox is not None,
+            "has_body_bbox": body_bbox is not None,
+        }
+
+        # 简单判断：裸露比例高就算有肢体裸露（降级模式不区分具体哪个肢体）
+        if exposure_ratio >= 0.35:
+            features["exposed_limbs"] = ["unknown_limb"]
+            features["limb_count"] = 1
+        else:
+            features["exposed_limbs"] = []
+            features["limb_count"] = 0
+
+        return exposure_ratio, features
+
     def is_in_region(self, pose_data: Dict, region: Tuple[Tuple[int, int], Tuple[int, int]]) -> Tuple[bool, Dict]:
         """检测人体是否在指定区域内
         region: ((x1, y1), (x2, y2)) 区域的左上角和右下角坐标

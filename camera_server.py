@@ -16,11 +16,30 @@ import time
 import socket
 import struct
 import yaml
+import traceback
 from picamera2 import Picamera2
 import numpy as np
 
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def log_crash(reason: str, exc_info=None):
+    """记录崩溃/退出原因到日志文件"""
+    try:
+        log_path = os.path.join(BASE_DIR, "data", "crash_log.txt")
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"[{timestamp}] 摄像头进程退出 - 原因: {reason}\n")
+            if exc_info and exc_info[0] is not None:
+                f.write(f"异常类型: {exc_info[0].__name__}\n")
+                f.write(f"异常信息: {exc_info[1]}\n")
+                f.write("堆栈追踪:\n")
+                traceback.print_tb(exc_info[2], file=f)
+            f.write(f"{'='*60}\n")
+    except Exception:
+        pass
 
 # 加载配置
 with open(os.path.join(BASE_DIR, "config.yaml"), 'r', encoding='utf-8') as f:
@@ -126,8 +145,7 @@ def main():
 
                 try:
                     while running:
-                        # capture_array() 返回的就是 OpenCV 原生 BGR 格式
-                        # 和原始版本保持一致，确保颜色顺序正确
+                        # capture_array() 返回 picamera2 配置的 main.format 格式
                         frame = picam2.capture_array()
 
                         # 直接发送原始 BGR 数据，跳过 JPEG 编解码
@@ -157,6 +175,15 @@ def main():
                 print(f"[Camera] 连接错误: {e}")
                 time.sleep(1)
 
+    except KeyboardInterrupt:
+        log_crash("用户主动 Ctrl+C 停止")
+        raise
+    except SystemExit as e:
+        log_crash(f"系统主动退出 (code={e.code})")
+        raise
+    except BaseException as e:
+        log_crash("异常崩溃", sys.exc_info())
+        raise
     finally:
         print("\n[Camera] 正在停止摄像头...")
         picam2.stop()

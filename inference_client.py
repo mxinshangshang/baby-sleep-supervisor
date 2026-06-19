@@ -18,7 +18,26 @@ import cv2
 import numpy as np
 import signal
 import threading
+import traceback
 from typing import Optional
+
+
+def log_crash(reason: str, exc_info=None):
+    """记录崩溃/退出原因到日志文件"""
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "crash_log.txt")
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"[{timestamp}] 推理进程退出 - 原因: {reason}\n")
+            if exc_info and exc_info[0] is not None:
+                f.write(f"异常类型: {exc_info[0].__name__}\n")
+                f.write(f"异常信息: {exc_info[1]}\n")
+                f.write("堆栈追踪:\n")
+                traceback.print_tb(exc_info[2], file=f)
+            f.write(f"{'='*60}\n")
+    except Exception:
+        pass
 
 # 添加src目录到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -430,6 +449,15 @@ def main():
 
             time.sleep(0.001)
 
+    except KeyboardInterrupt:
+        log_crash("用户主动 Ctrl+C 停止")
+        raise
+    except SystemExit as e:
+        log_crash(f"系统主动退出 (code={e.code})")
+        raise
+    except BaseException as e:
+        log_crash("异常崩溃", sys.exc_info())
+        raise
     finally:
         print("正在关闭资源...")
         if inference_worker:

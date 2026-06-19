@@ -9,10 +9,31 @@ import os
 import subprocess
 import signal
 import time
+import traceback
 from dataclasses import dataclass
 
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def log_crash(process_name: str, reason: str, exit_code: int = None, exc_info=None):
+    """记录崩溃/退出原因到日志文件"""
+    try:
+        log_path = os.path.join(BASE_DIR, "data", "crash_log.txt")
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"[{timestamp}] 主进程监控: {process_name} - {reason}\n")
+            if exit_code is not None:
+                f.write(f"退出码: {exit_code}\n")
+            if exc_info and exc_info[0] is not None:
+                f.write(f"异常类型: {exc_info[0].__name__}\n")
+                f.write(f"异常信息: {exc_info[1]}\n")
+                f.write("堆栈追踪:\n")
+                traceback.print_tb(exc_info[2], file=f)
+            f.write(f"{'='*60}\n")
+    except Exception:
+        pass
 
 # Python 路径（和kid_supervisor完全一致：摄像头用系统Python，推理用3.11虚拟环境）
 SYSTEM_PYTHON = "/usr/bin/python3"
@@ -155,6 +176,10 @@ def main():
     def restart_or_exit(state: ProcessState, starter):
         state.last_exit_code = state.proc.returncode if state.proc else None
         state.restart_count += 1
+
+        # 记录退出原因
+        exit_reason = "主动关闭" if shutting_down else "异常崩溃"
+        log_crash(state.name, exit_reason, state.last_exit_code)
         print(f"[Main] {state.name} 退出 (code: {state.last_exit_code})")
 
         # 主动关闭时不再重启
@@ -210,6 +235,15 @@ def main():
                 if rc is not None:
                     return rc
 
+    except KeyboardInterrupt:
+        log_crash("主进程", "用户主动 Ctrl+C 停止")
+        raise
+    except SystemExit as e:
+        log_crash("主进程", f"系统主动退出 (code={e.code})")
+        raise
+    except BaseException as e:
+        log_crash("主进程", "异常崩溃", exc_info=sys.exc_info())
+        raise
     finally:
         cleanup()
 

@@ -35,6 +35,8 @@ class Storage:
         # 上次清理时间
         self.last_cleanup_time = 0
         self.cleanup_interval = 3600  # 每小时清理一次
+        self.last_debug_cleanup_time = 0
+        self.debug_retention_hours = 48  # events_debug 只保留48小时
 
     def _init_db(self):
         """初始化数据库表"""
@@ -159,27 +161,21 @@ class Storage:
 
     def save_event(self, event_type: str, level: str, message: str,
                    details: Optional[Dict] = None, photo_path: Optional[str] = None,
-                   update_stats: bool = True, to_debug_table: bool = False) -> int:
-        """保存事件到数据库
-        返回事件ID
+                   update_stats: bool = True) -> int:
+        """保存事件到 events 表（告警/通知级别的事件）。
 
         update_stats: 是否更新 statistics 表与触发清理。
-                      调试/维测打点设为 False，避免污染日统计。
-        to_debug_table: 写入 events_debug 维测表（不占用 events 表ID序列）。
-                        用于 audio_heartbeat 等频繁打点的维测数据。
+                      调试/维测打点应使用 save_debug_event()，不经过此方法。
         """
         timestamp = time.time()
-        # 序列化 details：尽量用 JSON（便于事后查询/解析），失败时回退 str()
         details_str = self._serialize_details(details) if details else None
 
         conn = sqlite3.connect(self.sqlite_path)
         cursor = conn.cursor()
 
-        table_name = "events_debug" if to_debug_table else "events"
-
         try:
-            cursor.execute(f'''
-                INSERT INTO {table_name} (event_type, level, message, details, photo_path, timestamp)
+            cursor.execute('''
+                INSERT INTO events (event_type, level, message, details, photo_path, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (event_type, level, message, details_str, photo_path, timestamp))
 
@@ -305,12 +301,10 @@ class Storage:
 
     def save_debug_event(self, event_type: str, level: str, message: str,
                          details: Optional[Dict] = None, photo_path: Optional[str] = None) -> int:
-        """保存维测打点事件到 events_debug 表。
-        - 不影响 events 表的 ID 序列
-        - 不更新 statistics
-        - 不触发清理
-        - 不发通知
-        专门用于 region_debug / 算法中间值记录，便于事后定位误报。
+        """保存维测事件到 events_debug 表。
+
+        与 save_event() 完全隔离：不影响 events 表 ID 序列、不更新 statistics、不触发主清理。
+        写入时自动触发 48 小时滚动清理，保持表内始终只有最近两天的数据。
         """
         timestamp = time.time()
         details_str = self._serialize_details(details) if details else None
@@ -324,12 +318,36 @@ class Storage:
             ''', (event_type, level, message, details_str, photo_path, timestamp))
             event_id = cursor.lastrowid
             conn.commit()
+
+            # 每写入一条 debug 事件，顺势做一次 48h 滚动清理（低成本 DELETE）
+            if time.time() - self.last_debug_cleanup_time > 600:  # 10分钟内最多清理一次
+                cursor.execute(
+                    'DELETE FROM events_debug WHERE timestamp < ?',
+                    (time.time() - self.debug_retention_hours * 3600,)
+                )
+                conn.commit()
+                self.last_debug_cleanup_time = time.time()
+
+            return event_id
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
-        return event_id
+
+    def save_diagnostic_snapshot(self, snapshot: Dict) -> int:
+        """保存全系统诊断快照到 events_debug 表。
+
+        snapshot 应包含: frame, presence, audio, cry, occlusion, exposure, region, prone,
+                       face_absence, alerts 等所有检测器的当前状态。
+        用于事后通过 OpenClaw 查询还原任意时刻的系统全貌。
+        """
+        return self.save_debug_event(
+            event_type="diagnostic_snapshot",
+            level="debug",
+            message=f"frame={snapshot.get('frame', 0)}",
+            details=snapshot,
+        )
 
     def get_events(self, start_time: float = None, end_time: float = None,
                    level: str = None, event_type: str = None, limit: int = 100) -> List[Dict]:

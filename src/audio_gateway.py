@@ -25,15 +25,16 @@ logger = logging.getLogger(__name__)
 class AudioFeatures:
     """音频特征输出（传给主进程的唯一数据结构）"""
     timestamp: float
-    rms_volume: float
-    cry_confidence: float        # 综合哭声置信度（声学分+节律分，各50%）
-    cry_pattern_match: float     # 哭声模式匹配度（声学特征满足度）
-    is_crying: bool
-    processing_latency_ms: float # 处理延迟（监控用）
+    seq: int = 0                    # 递增序列号，用于检测数据停滞
+    rms_volume: float = 0.0
+    cry_confidence: float = 0.0     # 综合哭声置信度（声学分+节律分，各50%）
+    cry_pattern_match: float = 0.0  # 哭声模式匹配度（声学特征满足度）
+    is_crying: bool = False
+    processing_latency_ms: float = 0.0  # 处理延迟（监控用）
     # ===== P0 节律检测新增字段 =====
-    rhythm_score: float = 0.0      # 节律评分（0-1.0，哭声节律匹配度
-    burst_count: int = 0        # 连续哭声爆发次数
-    avg_interval_s: float = 0.0    # 平均周期间隔（秒）
+    rhythm_score: float = 0.0       # 节律评分（0-1.0，哭声节律匹配度）
+    burst_count: int = 0            # 连续哭声爆发次数
+    avg_interval_s: float = 0.0     # 平均周期间隔（秒）
     acoustic_confidence: float = 0.0  # 纯声学分（不含节律）
 
 
@@ -82,6 +83,7 @@ class LightweightCryDetector:
         # 节律检测状态
         self.last_peak_timestamp = 0.0
         self.consecutive_cry_bursts = 0  # 连续符合节律的爆发计数
+        self.seq = 0  # 递增序列号，用于检测数据停滞
 
     def _apply_noise_reduction(self, audio: np.ndarray) -> np.ndarray:
         """
@@ -274,9 +276,11 @@ class LightweightCryDetector:
         pattern_match = sum(conditions) / len(conditions)
 
         latency_ms = (time.time() - start_time) * 1000
+        self.seq += 1
 
         return AudioFeatures(
             timestamp=current_timestamp,
+            seq=self.seq,
             rms_volume=float(volume),
             cry_confidence=float(smoothed_confidence),
             cry_pattern_match=float(pattern_match),
@@ -532,6 +536,7 @@ def multimodal_fusion(
     基于证据理论的简化实现：
     - 各证据源独立加权
     - 交叉确认加成
+    - 连续爆发模式加成（真哭最强特征！）
     - 单模态弱证据抑制
     """
     audio_conf = audio_features.cry_confidence
@@ -541,6 +546,16 @@ def multimodal_fusion(
 
     # 加权基础融合
     fused = audio_conf * audio_weight + visual_confidence * visual_weight + motion_confidence * motion_weight
+
+    # 🔴 连续爆发模式加成：这是区分"真哭"和"随机噪音"的最强特征！
+    # 3次以上典型哭腔节律：直接给置信度boost
+    burst_count = audio_features.burst_count
+    if burst_count >= 5:
+        fused = min(1.0, fused + 0.15)
+    elif burst_count >= 4:
+        fused = min(1.0, fused + 0.12)
+    elif burst_count >= 3:
+        fused = min(1.0, fused + 0.08)
 
     # 交叉确认加成
     both_strong = audio_conf >= 0.5 and visual_confidence >= 0.5
