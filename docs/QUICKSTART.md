@@ -153,7 +153,7 @@ tail -f /tmp/baby_preview.log
 
 **A**: 确认宝宝在画面中央，调整角度让脸部和身体都可见。MediaPipe 需要一定的清晰度和角度才能检测到关键点。
 
-### Q: 误报太多？哭闹太灵敏？
+### Q: 误报太多？哭闹太灵敏？遮挡误报？
 
 **A**: 调整阈值（`config.yaml`）:
 
@@ -162,6 +162,9 @@ detection:
   cry_confidence_threshold: 0.6    # 从0.5调到0.6或0.7
   cry_duration_threshold: 3.0      # 从2秒调到3秒
   occlusion_threshold: 0.85        # 从0.75调高
+
+notification:
+  alert_cooldown_s: 30.0           # 冷却时间加长，减少重复通知
 ```
 
 ### Q: 漏报？哭闹没检测到？

@@ -835,10 +835,12 @@ class SleepSupervisor:
 
         # ============================================================
         # 【先定义 in_region 和 region_status 变量，避免后面使用时未定义】
-        # 正确的检测逻辑在后面会覆盖这些默认值
+        # 默认 True：检测块（面部缺失/趴睡/哭闹场景2/遮挡/踢被子）依赖 in_region，
+        # 但它们都在区域检测（1387行）之前执行。区域检测会在后面计算真实值，
+        # 用于纯音频通道（1662行）和下一帧。1帧滞后 @3fps ≈ 333ms 可忽略。
         # ============================================================
-        in_region = False
-        region_status = "out_of_region"
+        in_region = True
+        region_status = "in_region"
         decision_basis = presence.get("reason", "unknown")
         body_overlap = 0.0
         torso_overlap = 0.0
@@ -1189,7 +1191,7 @@ class SleepSupervisor:
             if presence["confirmed"] and in_region:
                 if landmarks is not None:
                     # 通用遮挡检测：检测任何物体（手/被子/玩具/枕头/衣物等）
-                    occlusion_confidence, occlusion_features = self.face_detector.detect_occlusion(frame, landmarks)
+                    occlusion_confidence, occlusion_features = self.face_detector.detect_occlusion(frame, landmarks, hands)
                 else:
                     # landmarks 不可用（侧脸/遮挡严重）→ 降级用头部 ROI 检测
                     occlusion_confidence, occlusion_features = self.face_detector.detect_head_occlusion_fallback(frame, pose_summary.get("head_bbox"), hands)
@@ -1531,6 +1533,7 @@ class SleepSupervisor:
                 presence["confirmed"]
                 and region_status == "in_region"
                 and exit_ratio <= 0.5  # 进入和离开门槛一致
+                and body_overlap >= self.region_body_overlap_threshold  # 身体必须在区域内，防止空床误检
             )
 
             # ============================================================

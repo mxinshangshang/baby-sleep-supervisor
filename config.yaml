@@ -1,0 +1,131 @@
+audio:
+  cry_detection_enabled: true
+  device_id: null
+  enabled: true
+  process_mode: true
+  sample_rate: 16000
+camera:
+  device_id: 0
+  format: BGR888
+  fps: 15
+  height: 540
+  jpeg_quality: 80
+  use_full_sensor_fov: true
+  width: 960
+detection:
+  alert_requires_confirmed_presence: true
+  breath_abnormal_threshold: 0.2
+  breath_detection_enabled: false
+  cry_confidence_threshold: 0.5
+  cry_detection_enabled: true
+  cry_duration_threshold: 2.0
+  cry_sensitivity: high
+  exposure_duration_threshold: 8.0
+  exposure_threshold: 0.35
+  face_absence_detection_enabled: true
+  face_absence_duration_threshold: 10.0
+  face_min_bbox_area: 900
+  head_bbox_padding_px: 20
+  limb_exposure_enabled: true
+  moro_reflex_filter_enabled: true
+  occlusion_detection_enabled: true
+  occlusion_duration_threshold: 2.0
+  occlusion_threshold: 0.75
+  pose_bbox_padding_px: 12
+  pose_min_body_bbox_area: 1800
+  pose_min_core_landmarks: 2
+  pose_min_torso_bbox_area: 500
+  pose_min_visible_landmarks: 8
+  pose_visibility_threshold: 0.5
+  presence_confirm_ratio: 0.75
+  presence_score_threshold: 0.7
+  presence_uncertain_grace_s: 2.0
+  presence_window_size: 8
+  prone_detection_enabled: true
+  prone_duration_threshold: 5.0
+  region_body_overlap_threshold: 0.4
+  region_confirm_frames: 5
+  region_detection_enabled: true
+  region_exit_confirm_ratio: 0.5
+  region_exit_window_size: 6
+  region_torso_overlap_threshold: 0.5
+  safe_region:
+  - - 429
+    - 184
+  - - 925
+    - 86
+  - - 911
+    - 539
+  - - 412
+    - 404
+dual_camera:
+  check_interval_frames: 30
+  default_camera: 0
+  enabled: true
+  light_detection:
+    day_threshold: 0.3
+    min_switch_interval: 300
+    night_threshold: 0.15
+    stable_frames: 7
+  night_camera_id: 1
+  normal_camera_id: 0
+  warmup_overlap_s: 2.0
+inference:
+  display_fps: 15
+  enable_face_detection: true
+  enable_pose_detection: true
+  inference_fps: 3
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+  model_complexity: 1
+network:
+  host: 127.0.0.1
+  port: 65433
+  recv_timeout_s: 0.2
+  send_timeout_s: 5.0
+notification:
+  alert_cooldown_s: 10.0
+  alert_level: warning
+  capture_photo_on_alert: true
+  console_enabled: true
+  enabled_alert_types:
+  - cry_detected
+  - occlusion_detected
+  - region_exit
+  - region_enter
+  - prone_detected
+  - face_not_visible
+  feishu_enabled: true
+  feishu_secret: ''
+  feishu_webhook: https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-token
+preview:
+  show_detection_boxes: true
+  show_help: true
+  show_safe_region: true
+  show_statistics: true
+  window_name: Baby Sleep Supervisor
+process:
+  max_restart_attempts: 5
+  restart_backoff_base_s: 2
+  restart_reset_after_s: 60
+  status_log_interval_s: 30
+storage:
+  auto_cleanup_enabled: true
+  enabled: true
+  max_photo_size_mb: 1024
+  photo_dir: data/photos
+  photo_quality: 90
+  sqlite_path: data/events.db
+supervision:
+  alert_cooldown_s: 10.0
+  event_retention_days: 30
+  severity_danger_threshold: 80.0
+  severity_notice_threshold: 30.0
+  severity_warning_threshold: 60.0
+thermal:
+  enabled: true
+  temp_check_interval_s: 10.0
+  temp_throttle_c: 75.0
+  temp_warn_c: 65.0
+  throttle_inference_fps: 2
+  throttle_model_complexity: 0

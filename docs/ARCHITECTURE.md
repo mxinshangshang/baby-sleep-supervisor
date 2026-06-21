@@ -249,15 +249,14 @@ def __getattr__(name):
 **核心逻辑**: `face_detector.detect_occlusion()`
 
 ```
-步骤：
-  1. Face Mesh 提取 4个关键点 (鼻+嘴三角区)
-  2. 裁剪 ROI → 灰度化 → 局部二值模式
-  3. 纹理模糊度 + 边缘密度 → 遮挡评分
-  4. 手部 bbox 与口鼻 ROI 重叠 → 风险加成
+三层抑制误报：
+  1. HSV 肤色比例（H:[0,30] S:[10,255] V:[40,255] 加宽范围）
+  2. FaceMesh 质量门控（≥406关键点 → 非皮肤×0.45；≥310 → ×0.65）
+  3. 手部交叉验证（无手部重叠 → 置信度×0.6）
 
 降级路径：
-  Face Mesh 可用 → 精准纹理分析
-  Face Mesh 不可用 → fallback 肤色+边缘
+  Face Mesh 可用 → 精准纹理分析 + 手部交叉验证
+  Face Mesh 不可用 → fallback 肤色+边缘+气道ROI
   完全不可见 → 面部缺失检测接管
 ```
 
@@ -306,10 +305,16 @@ face_mode == "pose_head_side_visible" (只有姿态头框，没有人脸网格)
 
 **判断逻辑**:
 ```
-身体框 bbox 与安全区域重叠率：
-  body_overlap < 0.40 + torso_overlap < 0.50
-  持续 ≥ region_exit_confirm_ratio (50% 的 6帧窗口)
-  → 判定离开区域
+6级优先级判断（从强到弱）：
+  1. face_center_in_region → 金标准，直接判定在区域内
+  2. face_bbox + face_center_in_region → 盖被子场景
+  3. head_center_in_region + body_overlap ≥ 0.20 → 姿态辅助
+  4. torso_overlap ≥ 0.50 + body_overlap ≥ 0.40 → 标准阈值
+  5. torso_center_in_region + body_overlap ≥ 0.25 → 宽松兜底
+  6. 无检测信号 → 保持上一帧状态，防止抖动
+
+离开确认：body_overlap < 0.40 且 6帧滑窗中 50% 离开 → region_exit
+进入确认：body_overlap ≥ 0.40 + 6帧滑窗 ≤ 50% 离开 → region_enter
 
 边缘触发：
   只有状态翻转 (in→out / out→in) 才发通知
@@ -402,6 +407,8 @@ bright_counter ≥ stable_frames(7) → 切回常规 (cam0)
 | 检测结果过期 | detection_stale > 阈值 → 停止显示旧状态，避免误导 |
 | 存在确认缓冲 | 所有告警前置 presence 确认，空床不报 |
 | 结果防抖 | 所有判断都有时序窗口，不依赖单帧 |
+| 信号重入保护 | 信号处理函数禁止 `print()`，避免 stdout 重入 RuntimeError |
+| in_region 滞后 | 检测块使用上一帧的 in_region 值（1帧滞后 @3fps ≈ 333ms），区域检测在末尾更新 |
 | 推理线程自愈 | 推理线程崩溃自动重启并清除过期结果 |
 | 优雅退出 | `shutting_down` 标志位防止退出时触发自动重启 |
 
@@ -416,7 +423,7 @@ bright_counter ≥ stable_frames(7) → 切回常规 (cam0)
 | 哭闹 | cry_confidence_threshold | 0.5 |
 | | cry_duration_threshold | 2.0秒 |
 | 遮挡 | occlusion_threshold | 0.75 |
-| | occlusion_duration_threshold | 2.0秒 |
+| | occlusion_confirm_frames | 3帧（FaceMesh质量门控+手部交叉验证） |
 | 裸露 | exposure_threshold | 0.35 |
 | | exposure_duration_threshold | 8.0秒 |
 | 区域 | region_body_overlap_threshold | 0.40 |

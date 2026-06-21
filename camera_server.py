@@ -118,7 +118,7 @@ def main():
     def handle_sigint(signum, frame):
         nonlocal running
         running = False
-        print("\n[Camera] 收到停止信号")
+        # 不在此处 print：信号可能在 print() 内部到达，导致 stdout 重入 RuntimeError
 
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)

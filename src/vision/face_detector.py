@@ -530,25 +530,23 @@ class FaceDetector:
 
         return confidence, features
 
-    def detect_occlusion(self, frame: np.ndarray, landmarks: np.ndarray) -> Tuple[float, Dict]:
-        """检测脸部遮挡（极简通用方案）
+    def detect_occlusion(self, frame: np.ndarray, landmarks: np.ndarray, hands: Optional[List[Dict]] = None) -> Tuple[float, Dict]:
+        """检测脸部遮挡
 
-        核心逻辑：不管是什么物体（手/被子/玩具/...），只看「脸部有多少被非皮肤区域覆盖」
-        1. ROI = 整个脸部区域（不是 tiny 的口鼻区域），稳定可靠
-        2. 计算 = 非皮肤像素占脸部区域的比例
-        3. 加权 = 口鼻区域被遮挡有额外权重（关键气道位置）
+        肤色比例 + FaceMesh 质量门控 + 手部交叉验证。
+        FaceMesh 成功检测大量关键点本身就是脸部清晰可见的最强信号，
+        此时非皮肤区域大概率是光照/阴影/发丝等无害因素。
         """
         if landmarks is None:
             return 0.0, {}
 
         h, w, _ = frame.shape
+        n_landmarks = len(landmarks)
 
-        # ========== 1. 定义检测区域：整个脸部 ==========
-        # 从 landmarks 计算完整脸部边界（比口鼻区域大得多，稳定）
+        # ========== 1. 定义检测区域 ==========
         x_min, y_min = landmarks.min(axis=0)
         x_max, y_max = landmarks.max(axis=0)
 
-        # 扩展到整个脸部区域（上下左右各扩展一点）
         face_x1 = int(max(0, x_min - 15))
         face_y1 = int(max(0, y_min - 15))
         face_x2 = int(min(w, x_max + 15))
@@ -557,9 +555,8 @@ class FaceDetector:
         if face_x1 >= face_x2 or face_y1 >= face_y2:
             return 0.0, {}
 
-        # ========== 2. 定义关键区域：口鼻区域 ==========
-        # 气道关键位置（额外加权）
-        nose_tip = landmarks[1]  # 鼻尖
+        # ========== 2. 口鼻关键区域 ==========
+        nose_tip = landmarks[1]
         mouth_left = landmarks[self.MOUTH_LEFT]
         mouth_right = landmarks[self.MOUTH_RIGHT]
         mouth_bottom = landmarks[self.MOUTH_BOTTOM]
@@ -569,58 +566,79 @@ class FaceDetector:
         mouth_x2 = int(min(w, max(mouth_right[0], nose_tip[0]) + 10))
         mouth_y2 = int(min(h, mouth_bottom[1] + 10))
 
-        # ========== 3. 肤色检测（通用，不管是什么物体）==========
-        # 肤色范围 HSV
-        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
-        upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+        # ========== 3. 肤色检测（加宽范围，减少光照误判）==========
+        lower_skin = np.array([0, 10, 40], dtype=np.uint8)
+        upper_skin = np.array([30, 255, 255], dtype=np.uint8)
 
-        # 整个脸部的非皮肤比例
         face_roi = frame[face_y1:face_y2, face_x1:face_x2]
         hsv_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2HSV)
         skin_mask_face = cv2.inRange(hsv_face, lower_skin, upper_skin)
         face_skin_ratio = np.sum(skin_mask_face > 0) / (skin_mask_face.size + 1e-6)
         face_non_skin_ratio = 1.0 - face_skin_ratio
 
-        # 口鼻区域的非皮肤比例（关键位置，权重更高）
-        mouth_confidence = 0.0
+        mouth_non_skin_ratio = 0.0
         if mouth_x1 < mouth_x2 and mouth_y1 < mouth_y2:
             mouth_roi = frame[mouth_y1:mouth_y2, mouth_x1:mouth_x2]
             hsv_mouth = cv2.cvtColor(mouth_roi, cv2.COLOR_BGR2HSV)
             skin_mask_mouth = cv2.inRange(hsv_mouth, lower_skin, upper_skin)
             mouth_skin_ratio = np.sum(skin_mask_mouth > 0) / (skin_mask_mouth.size + 1e-6)
             mouth_non_skin_ratio = 1.0 - mouth_skin_ratio
-            mouth_confidence = mouth_non_skin_ratio
 
-        # ========== 4. 综合置信度计算 ==========
-        # 权重：70% 整个脸部遮挡 + 30% 口鼻区域遮挡
-        # 理由：脸部整体被遮更危险，口鼻是关键位置额外加权
+        # ========== 4. FaceMesh 质量门控 ==========
+        # 关键点越多 → 脸部越清晰可见 → 非皮肤更可能是阴影而非遮挡
+        mesh_quality = min(1.0, n_landmarks / 478.0)
+        if mesh_quality >= 0.85:  # ≥406 个关键点：面部几乎完整可见
+            face_non_skin_ratio *= 0.45
+            mouth_non_skin_ratio *= 0.45
+        elif mesh_quality >= 0.65:  # ≥310 个关键点
+            face_non_skin_ratio *= 0.65
+            mouth_non_skin_ratio *= 0.65
+
+        # ========== 5. 综合置信度 ==========
         face_weight = 0.70
         mouth_weight = 0.30
-        confidence = face_weight * face_non_skin_ratio + mouth_weight * mouth_confidence
+        confidence = face_weight * face_non_skin_ratio + mouth_weight * mouth_non_skin_ratio
 
-        # ========== 5. 侧睡/姿态处理 ==========
-        # 简单处理：脸部太窄（左右比例 < 0.6）→ 疑似侧睡，降低置信度
-        # 侧睡时 landmarks 可能不准，避免误报
+        # ========== 6. 手部交叉验证 ==========
+        hand_overlap = 0.0
+        if hands:
+            face_roi_bbox = (face_x1, face_y1, face_x2, face_y2)
+            for hand in hands or []:
+                hb = hand.get("bbox")
+                if not hb:
+                    continue
+                ix1, iy1 = max(face_x1, hb[0]), max(face_y1, hb[1])
+                ix2, iy2 = min(face_x2, hb[2]), min(face_y2, hb[3])
+                if ix2 > ix1 and iy2 > iy1:
+                    overlap = (ix2 - ix1) * (iy2 - iy1) / max(1, (face_x2 - face_x1) * (face_y2 - face_y1))
+                    hand_overlap = max(hand_overlap, overlap)
+
+        # 无手部重叠时进一步压低置信度
+        if hand_overlap < 0.05:
+            confidence *= 0.6
+
+        # ========== 7. 侧睡处理 ==========
         face_width_ratio = (face_x2 - face_x1) / max(1, (face_y2 - face_y1))
         is_likely_side_face = face_width_ratio < 0.65
         if is_likely_side_face:
-            confidence *= 0.75  # 侧睡时打 75 折，更保守
+            confidence *= 0.75
 
-        # ========== 6. 特征返回 ==========
+        # ========== 8. 特征返回 ==========
         features = {
-            "roi_bbox": (face_x1, face_y1, face_x2, face_y2),  # 现在是整个脸部！
+            "roi_bbox": (face_x1, face_y1, face_x2, face_y2),
             "mouth_roi_bbox": (mouth_x1, mouth_y1, mouth_x2, mouth_y2),
             "face_skin_ratio": float(face_skin_ratio),
             "face_non_skin_ratio": float(face_non_skin_ratio),
-            "mouth_non_skin_ratio": float(mouth_confidence),
+            "mouth_non_skin_ratio": float(mouth_non_skin_ratio),
             "face_width_ratio": float(face_width_ratio),
             "is_likely_side_face": bool(is_likely_side_face),
+            "mesh_quality": float(mesh_quality),
+            "hand_overlap": float(hand_overlap),
         }
 
-        # 报警原因
         if confidence >= 0.35:
             features["reason"] = "face_occlusion_generic"
-        elif mouth_confidence >= 0.5:
+        elif mouth_non_skin_ratio >= 0.5:
             features["reason"] = "mouth_nose_area_occluded"
         else:
             features["reason"] = "no_significant_occlusion"
