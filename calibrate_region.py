@@ -29,9 +29,11 @@ from src.config import CONFIG_PATH
 ALERT_OPTIONS = [
     ("cry_detected", "Crying"),
     ("occlusion_detected", "Face covered"),
-    ("limb_exposure", "Left hand exposed"),
+    ("limb_exposure", "Limb exposed / kick blanket"),
     ("region_exit", "Out of safe region"),
     ("region_enter", "Enter safe region"),
+    ("prone_detected", "Prone sleeping risk"),
+    ("face_not_visible", "Face not visible"),
 ]
 
 

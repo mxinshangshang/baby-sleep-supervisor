@@ -1,4 +1,4 @@
-# 系统架构总览 - Baby Sleep Supervisor v1.0
+# 系统架构总览 - Baby Sleep Supervisor
 
 ---
 
@@ -14,10 +14,15 @@
                           │ camera_server.py    │   │ inference_client.py  │
                           │ 摄像头采集进程      │   │ 推理客户端进程       │
                           │ (系统Python)        │   │ (Python 3.11 venv)   │
+                          │                     │   │                      │
+                          │ ┌─────────────────┐ │   │                      │
+                          │ │ CameraRouter    │ │   │                      │
+                          │ │ (双摄互斥路由)  │ │   │                      │
+                          │ └─────────────────┘ │   │                      │
                           └─────────┬───────────┘   └───────────┬──────────┘
                                     │                           │
                                     │  TCP:65433               │
-                                    │  BGR888 零拷贝          │
+                                    │  RGB888 零拷贝          │
                                     └───────────────────────────┘
 ```
 
@@ -30,16 +35,25 @@
 
 **职责**:
 - 独占摄像头硬件，使用 `picamera2` 原生接口采集
-- 支持多种像素格式：BGR888, RGB888, YUV420
+- 支持双摄像头自动切换（常规 imx708_wide ↔ 夜视 imx708_wide_noir）
 - 固定帧率推送，避免推理波动影响采集稳定性
-- TCP Socket 服务端，帧头：4字节 little-endian 长度 + 原始像素数据
+- TCP Socket 服务端，帧头：4字节 little-endian 长度 + 原始 BGR 像素数据
+- 日志重定向到 `/tmp/camera_server.log`，`PYTHONUNBUFFERED=1` 确保实时输出
+
+**双摄路由 (CameraRouter)**:
+- 对外暴露与 Picamera2 同名的鸭子接口 (`capture_array()`, `camera_configuration()`)
+- 亮度检测基于图像中心 50% 区域灰度均值归一化到 0-1
+- 迟滞比较器防抖：`night_threshold=0.15`（低于此切夜视），`day_threshold=0.30`（高于此切回）
+- `stable_frames=7`（15fps 下约 0.5s 确认），`min_switch_interval=300s`（防来回抖动）
+- 切换时新旧摄像头 `warmup_overlap_s=2.0s` 重叠，异步关闭旧摄像头
+- 线程安全，`_switch_lock` 防止并发切换
 
 **关键优化**:
 ```python
 # 全传感器视野模式 - Camera Module 3 Wide 专用
 use_full_sensor_fov: true
 
-# 默认 960x540 BGR888 15fps
+# 默认 960x540 RGB888 15fps
 # 与 OpenCV 直接兼容，零拷贝
 ```
 
@@ -80,9 +94,38 @@ use_full_sensor_fov: true
 
 ---
 
+## 模块懒加载 (src/__init__.py)
+
+使用 PEP 562 `__getattr__` 实现按需导入，防止 `camera_server.py` 导入 `src` 包时触发 `mediapipe` 等重型依赖加载：
+
+```python
+_LAZY_EXPORTS = {
+    'AudioCryDetector': '.audio_detector',
+    'fuse_audio_visual_cry': '.audio_detector',
+    'get_config': '.config',
+    'load_config': '.config',
+    'save_config': '.config',
+    'Notifier': '.notifier',
+    'Storage': '.storage',
+    'SleepSupervisor': '.supervision',
+}
+
+def __getattr__(name):
+    if name in _LAZY_EXPORTS:
+        module = __import__(_LAZY_EXPORTS[name], fromlist=[name], level=1)
+        attr = getattr(module, name)
+        globals()[name] = attr
+        return attr
+    raise AttributeError(...)
+```
+
+**设计原因**: `camera_server.py`（系统 Python）仅需要 `CameraRouter`，不应加载 `mediapipe`。`CameraRouter` 通过 `from src.camera.dual_camera_proxy import CameraRouter` 直接导入子模块，绕过 `src/__init__.py`。
+
+---
+
 ## 监督核心 (supervision.py)
 
-**代码量**: 1513行，占总代码 31%
+**代码量**: 1852行
 
 ### 检测流水线
 
@@ -192,6 +235,11 @@ use_full_sensor_fov: true
 融合层：multimodal_fusion()
   声学分(50%) + 节律分(50%) → 最终置信度
   视觉置信度与音频置信度加权融合
+
+三种检测路径：
+  场景1：人脸可见 + presence确认 → 面部表情 + 音频 + 动作融合
+  场景2：in_region但landmarks不可用 → 音频为主 + 动作辅助
+  场景3：不在区域内 → 纯音频路径（audio_only_cry_threshold=0.3）
 ```
 
 ---
@@ -224,6 +272,8 @@ face_mode == "pose_head_side_visible" (只有姿态头框，没有人脸网格)
 → 判定为"面部朝下 / 趴睡风险"
 ```
 
+使用独立的 `face_mesh_absence_start_time` 计时器，与面部可见性追踪解耦。
+
 ---
 
 ### 6. 肢体裸露检测 (Limb Exposure)
@@ -241,7 +291,9 @@ face_mode == "pose_head_side_visible" (只有姿态头框，没有人脸网格)
   → exposure_ratio 阈值 0.35
   → 持续 ≥ 8秒 告警
 
-排除：外部人手靠近不算踢被子
+排除：
+  外部人手靠近不算踢被子
+  Moro 惊跳反射时大幅衰减（×0.35）
 ```
 
 ---
@@ -255,8 +307,8 @@ face_mode == "pose_head_side_visible" (只有姿态头框，没有人脸网格)
 **判断逻辑**:
 ```
 身体框 bbox 与安全区域重叠率：
-  body_overlap < 0.55 + torso_overlap < 0.50
-  持续 ≥ region_exit_confirm_ratio (33% 的 6帧窗口)
+  body_overlap < 0.40 + torso_overlap < 0.50
+  持续 ≥ region_exit_confirm_ratio (50% 的 6帧窗口)
   → 判定离开区域
 
 边缘触发：
@@ -270,17 +322,57 @@ face_mode == "pose_head_side_visible" (只有姿态头框，没有人脸网格)
 
 ---
 
-## 颜色编码系统 (Preview Renderer)
+### 8. 面部缺失检测 (Face Not Visible)
 
-| 颜色 | 元素 | 来源 | 说明 |
-|------|------|------|------|
-| 🔵 蓝 | Face Box | MediaPipe Face Detection | 检测到的人脸 |
-| 🟠 橙 | Head Box | MediaPipe Pose 0-10 | 姿态拟合的头部范围 |
-| 🟣 紫 | Torso Box | MediaPipe Pose 11,12,23,24 | 姿态拟合的躯干范围 |
-| 🟡 黄 | Hand Nearby | MediaPipe Hands | 手在头部附近 |
-| 🔴 红 | Hand Occluder | MediaPipe Hands + 重叠判断 | 手遮挡口鼻，高风险 |
-| 🟢 绿 | Safe Region | 手工标定 | 安全睡眠区域 |
-| ⚪ 青 | Pose Skeleton | MediaPipe Pose | 姿态骨架点和连线 |
+当人脸检测不到且姿态也无法确认头部位置，持续 ≥ `face_absence_duration_threshold`（默认 10s）触发 `face_not_visible` 告警。
+
+---
+
+## 事件存储与维测
+
+**模块**: storage.py + SQLite
+
+```
+events 表（告警事件）：
+  id, timestamp, type, level, confidence, photo_path, details
+
+events_debug 表（诊断快照）：
+  id, timestamp, snapshot_json (完整系统状态)
+  每 30 帧写入一次，保留 48 小时
+  支持按时间范围回溯分析历史误报/漏报
+
+自动清理：
+  event_retention_days: 30 天
+  max_photo_size_mb: 1024 MB
+```
+
+**诊断快照内容**：presence、音频特征、哭声置信度、遮挡分数、曝光比例、区域状态、趴睡标志、面部可见性、活跃告警队列、系统温度。
+
+---
+
+## 双摄像头系统
+
+### 硬件配置
+- cam0: imx708_wide（常规 RGB）
+- cam1: imx708_wide_noir（夜视，去 IR 滤光）
+
+### 自动切换流程
+```
+每 30 帧 (~2秒) 检测一次
+  ↓
+测量中心 50% 区域亮度
+  ↓
+亮度 < 0.15 → dark_counter++
+亮度 > 0.30 → bright_counter++
+  ↓
+dark_counter ≥ stable_frames(7) → 切换到夜视 (cam1)
+bright_counter ≥ stable_frames(7) → 切回常规 (cam0)
+  ↓
+切换后重置计数器，300s 内不再切换
+```
+
+### 手动切换
+发送 `SIGUSR2` 信号给 camera_server 进程触发强制切换。
 
 ---
 
@@ -301,21 +393,6 @@ face_mode == "pose_head_side_visible" (只有姿态头框，没有人脸网格)
 
 ---
 
-## 事件存储与生命周期
-
-**模块**: storage.py + SQLite
-
-```
-事件表：
-  id, timestamp, type, level, confidence, photo_path, details
-
-自动清理：
-  event_retention_days: 30 天
-  max_photo_size_mb: 1024 MB
-```
-
----
-
 ## 容错与自愈
 
 | 机制 | 说明 |
@@ -325,6 +402,8 @@ face_mode == "pose_head_side_visible" (只有姿态头框，没有人脸网格)
 | 检测结果过期 | detection_stale > 阈值 → 停止显示旧状态，避免误导 |
 | 存在确认缓冲 | 所有告警前置 presence 确认，空床不报 |
 | 结果防抖 | 所有判断都有时序窗口，不依赖单帧 |
+| 推理线程自愈 | 推理线程崩溃自动重启并清除过期结果 |
+| 优雅退出 | `shutting_down` 标志位防止退出时触发自动重启 |
 
 ---
 
@@ -336,29 +415,41 @@ face_mode == "pose_head_side_visible" (只有姿态头框，没有人脸网格)
 | | presence_confirm_ratio | 75% |
 | 哭闹 | cry_confidence_threshold | 0.5 |
 | | cry_duration_threshold | 2.0秒 |
-| 遮挡 | occlusion_threshold | 0.6 |
-| | occlusion_duration_threshold | 1.0秒 |
+| 遮挡 | occlusion_threshold | 0.75 |
+| | occlusion_duration_threshold | 2.0秒 |
 | 裸露 | exposure_threshold | 0.35 |
 | | exposure_duration_threshold | 8.0秒 |
-| 区域 | region_body_overlap_threshold | 0.55 |
+| 区域 | region_body_overlap_threshold | 0.40 |
 | | region_exit_window_size | 6帧 |
-| 趴睡 | face_mesh_absence_duration_threshold | 8.0秒 |
-| 冷却 | alert_cooldown_s | 60秒 |
+| | region_exit_confirm_ratio | 0.5 |
+| 趴睡 | prone_duration_threshold | 5.0秒 |
+| 面部缺失 | face_absence_duration_threshold | 10.0秒 |
+| 冷却 | alert_cooldown_s | 10秒 |
+| 双摄 | night_threshold | 0.15 |
+| | day_threshold | 0.30 |
+| | stable_frames | 7 |
+| | min_switch_interval | 300秒 |
 
 ---
 
 ## 代码统计
 
-| 文件 | 行数 | 占比 | 职责 |
-|------|------|------|------|
-| src/supervision.py | 1513 | 31% | 监督核心，所有检测逻辑 |
-| src/audio_gateway.py | 581 | 12% | 音频网关 + 哭声检测 |
-| src/vision/face_detector.py | 631 | 13% | 人脸+表情+手部+遮挡 |
-| src/preview_renderer.py | 457 | 9% | UI渲染 + 颜色编码 |
-| src/audio_detector.py | 449 | 9% | 音频信号处理 |
-| src/notifier.py | 393 | 8% | 飞书通知 |
-| src/storage.py | 387 | 8% | SQLite存储 |
-| src/vision/body_detector.py | 204 | 4% | 姿态检测 |
-| src/vision/region_detector.py | 158 | 3% | 区域判断 |
-| src/config.py | 54 | 1% | 配置管理 |
-| **总计** | **4846** | **100%** | |
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| src/supervision.py | 1852 | 监督核心，所有检测逻辑 |
+| src/audio_gateway.py | 596 | 音频网关 + 哭声检测 |
+| src/vision/face_detector.py | 636 | 人脸+表情+手部+遮挡 |
+| src/preview_renderer.py | 497 | UI渲染 + 颜色编码 |
+| inference_client.py | 487 | 三流解耦推理客户端 |
+| src/audio_detector.py | 449 | 音频信号处理 |
+| src/storage.py | 409 | SQLite存储 + 诊断快照 |
+| src/notifier.py | 393 | 飞书通知 |
+| main.py | 259 | 双进程管理 + 自动重启 |
+| src/vision/body_detector.py | 259 | 姿态检测 |
+| camera_server.py | 174 | 摄像头采集 + 双摄路由 |
+| src/camera/dual_camera_proxy.py | 162 | 双摄互斥路由 |
+| src/vision/region_detector.py | 158 | 区域判断 |
+| src/camera/ambient_light_detector.py | 89 | 环境光线检测 |
+| src/config.py | 54 | 配置管理 |
+| src/camera/__init__.py | 3 | 包导出 |
+| **总计** | **6477** | |

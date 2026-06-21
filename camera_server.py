@@ -3,11 +3,10 @@
 摄像头采集服务器
 使用系统 Python 运行，负责从摄像头采集帧并通过网络发送给推理客户端
 基于 picamera2 实现，兼容 Raspberry Pi Camera Module 3
-
 性能优化说明：
-1. 完整传感器 FOV 模式：1536x864 下采样自 4608x2592，保留广角
+1. 完整传感器 FOV 模式：960x540 下采样自 4608x2592，保留广角
 2. 零拷贝采集：使用 capture_request() 直接操作缓冲区
-3. YUV420 输出：原生格式，数据量减半，无需颜色空间转换
+3. RGB888 输出：原生格式，无需颜色空间转换
 4. 移除 JPEG 编解码：本机 TCP 传输直接发原始数据，省 CPU
 """
 import os
@@ -22,106 +21,97 @@ import numpy as np
 
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def log_crash(reason: str, exc_info=None):
-    """记录崩溃/退出原因到日志文件"""
-    try:
-        log_path = os.path.join(BASE_DIR, "data", "crash_log.txt")
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n{'='*60}\n")
-            f.write(f"[{timestamp}] 摄像头进程退出 - 原因: {reason}\n")
-            if exc_info and exc_info[0] is not None:
-                f.write(f"异常类型: {exc_info[0].__name__}\n")
-                f.write(f"异常信息: {exc_info[1]}\n")
-                f.write("堆栈追踪:\n")
-                traceback.print_tb(exc_info[2], file=f)
-            f.write(f"{'='*60}\n")
-    except Exception:
-        pass
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
 # 加载配置
-with open(os.path.join(BASE_DIR, "config.yaml"), 'r', encoding='utf-8') as f:
+with open(os.path.join(BASE_DIR, "config.yaml"), "r", encoding="utf-8") as f:
     CONFIG = yaml.safe_load(f)
 
 CAMERA_CFG = CONFIG["camera"]
 NETWORK_CFG = CONFIG["network"]
+DUAL_CFG = CONFIG.get("dual_camera", {}) or {}
+DUAL_ENABLED = bool(DUAL_CFG.get("enabled", False))
 
 WIDTH = CAMERA_CFG.get("width", 960)
 HEIGHT = CAMERA_CFG.get("height", 540)
 FPS = CAMERA_CFG.get("fps", 15)
-FORMAT = "RGB888"  # picamera2 原生格式，客户端转 BGR
+FORMAT = "RGB888"
 USE_FULL_SENSOR_FOV = CAMERA_CFG.get("use_full_sensor_fov", True)
 
 HOST = NETWORK_CFG.get("host", "127.0.0.1")
 PORT = NETWORK_CFG.get("port", 65433)
 
-# YUV420 帧大小计算：W*H*1.5 字节
-YUV_FRAME_SIZE = WIDTH * HEIGHT * 3 // 2
-
+def _build_picam_config(picam):
+    if USE_FULL_SENSOR_FOV:
+        return picam.create_video_configuration(
+            main={"size": (WIDTH, HEIGHT), "format": FORMAT},
+            raw={"size": (4608, 2592)},
+            controls={"FrameRate": FPS},
+        )
+    return picam.create_video_configuration(
+        main={"size": (WIDTH, HEIGHT), "format": FORMAT},
+        controls={"FrameRate": FPS},
+    )
 
 def init_camera():
-    """初始化摄像头
-    优化点：强制使用完整传感器 FOV，避免中心裁剪导致广角丢失
-    """
     print(f"[Camera] 初始化摄像头 {WIDTH}x{HEIGHT} @ {FPS}fps, format={FORMAT}")
     if USE_FULL_SENSOR_FOV:
         print(f"[Camera] 强制使用完整传感器阵列（广角最大化）")
 
-    picam2 = Picamera2()
+    if DUAL_ENABLED:
+        try:
+            from src.camera.dual_camera_proxy import CameraRouter
+            router = CameraRouter(
+                config_builder=_build_picam_config,
+                dual_cfg=DUAL_CFG,
+                storage=None,
+            )
+            router.start()
+            actual_config = router.camera_configuration()
+            print(f"[Camera] 实际配置（router透传active摄像头）:")
+            print(f"  输出尺寸: {actual_config.get('main', {}).get('size', 'N/A')}")
+            print(f"  传感器阵列: {actual_config.get('raw', {}).get('size', 'N/A')}")
+            print(f"  像素格式: {actual_config.get('main', {}).get('format', 'N/A')}")
+            print(f"  active_camera_id: {router.get_status().get('active_camera_id')}")
+            print("[Camera] CameraRouter初始化完成（双摄模式）")
+            return router
+        except Exception as e:
+            print(f"[Camera][WARN] 双摄路由初始化失败，降级为单摄模式: {e}")
+            traceback.print_exc()
 
-    if USE_FULL_SENSOR_FOV:
-        # 关键：指定 sensor 的输出大小，强制 ISP 使用完整传感器阵列下采样
-        # Camera Module 3 原生传感器是 4608x2592
-        config = picam2.create_video_configuration(
-            main={"size": (WIDTH, HEIGHT), "format": FORMAT},
-            raw={"size": (4608, 2592)},  # 强制使用完整传感器阵列
-            controls={"FrameRate": FPS}
-        )
-    else:
-        # 传统模式（可能中心裁剪，会损失广角）
-        config = picam2.create_preview_configuration(
-            main={"size": (WIDTH, HEIGHT), "format": FORMAT},
-            controls={"FrameRate": FPS}
-        )
-
-    picam2.configure(config)
-    picam2.start()
-
-    # 预热
+    cam = Picamera2()
+    config = _build_picam_config(cam)
+    cam.configure(config)
+    cam.start()
     time.sleep(2)
-    actual_config = picam2.camera_configuration()
+    actual_config = cam.camera_configuration()
     print(f"[Camera] 实际配置: ")
     print(f"  输出尺寸: {actual_config['main']['size']}")
     print(f"  传感器阵列: {actual_config.get('raw', {}).get('size', 'N/A')}")
     print(f"  像素格式: {actual_config['main']['format']}")
-    print("[Camera] 摄像头初始化完成")
-    return picam2
-
+    print("[Camera] 摄像头初始化完成（单摄模式）")
+    return cam
 
 def main():
     try:
-        # 初始化摄像头
-        picam2 = init_camera()
+        cam = init_camera()
     except Exception as e:
-        print(f"[Camera] 摄像头初始化失败: {e}")
+        print(f"[Camera] 初始化失败: {e}")
+        traceback.print_exc()
         return 1
 
-    # 创建socket服务器
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
     try:
         server_socket.bind((HOST, PORT))
         server_socket.listen(1)
         print(f"[Camera] 服务器启动，等待客户端连接: {HOST}:{PORT}")
     except Exception as e:
         print(f"[Camera] 服务器启动失败: {e}")
-        picam2.stop()
+        cam.stop()
         return 1
 
-    # 捕获SIGINT
     import signal
     running = True
 
@@ -133,65 +123,52 @@ def main():
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
 
+    SWITCH_CMD_PATH = os.path.join(BASE_DIR, "data", "dual_camera_switch.cmd")
+
+    def handle_force_switch(signum, frame):
+        if not hasattr(cam, "force_switch"):
+            print("[Camera] 收到信号但非双摄模式，忽略")
+            return
+        try:
+            with open(SWITCH_CMD_PATH, "r", encoding="utf-8") as f:
+                target = int(f.read().strip())
+            import threading
+            def _do():
+                try:
+                    ok = cam.force_switch(target)
+                    print(f"[Camera] 强制切换结果: {ok}")
+                except Exception as e:
+                    print(f"[Camera] 强制切换失败: {e}")
+            threading.Thread(target=_do, daemon=True).start()
+        except Exception as e:
+            print(f"[Camera] 信号处理失败: {e}")
+
+    signal.signal(signal.SIGUSR2, handle_force_switch)
+
     try:
+        client_socket, addr = server_socket.accept()
+        print(f"[Camera] 接受客户端连接: {addr}")
+        client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        frame_count = 0
         while running:
             try:
-                # 等待客户端连接
-                client_socket, addr = server_socket.accept()
-                print(f"[Camera] 客户端已连接: {addr}")
-
-                frame_count = 0
-                start_time = time.time()
-
-                try:
-                    while running:
-                        # capture_array() 返回 picamera2 配置的 main.format 格式
-                        frame = picam2.capture_array()
-
-                        # 直接发送原始 BGR 数据，跳过 JPEG 编解码
-                        frame_data = frame.tobytes()
-
-                        # 发送帧大小和数据
-                        client_socket.sendall(struct.pack("<L", len(frame_data)))
-                        client_socket.sendall(frame_data)
-
-                        frame_count += 1
-
-                        # 每秒打印一次帧率
-                        if frame_count % FPS == 0:
-                            elapsed = time.time() - start_time
-                            actual_fps = frame_count / elapsed
-                            print(f"[Camera] 发送帧率: {actual_fps:.1f}fps", end='\r')
-
-                except (BrokenPipeError, ConnectionResetError):
-                    print(f"\n[Camera] 客户端断开连接")
-                except Exception as e:
-                    print(f"\n[Camera] 传输错误: {e}")
-                finally:
-                    client_socket.close()
-                    print("[Camera] 连接已关闭，等待新的连接...")
-
+                frame = cam.capture_array()
+                frame_bytes = frame.tobytes()
+                header = struct.pack("<L", len(frame_bytes))
+                client_socket.sendall(header + frame_bytes)
+                frame_count += 1
+                if frame_count % 150 == 0:
+                    print(f"[Camera] 已发送 {frame_count} 帧")
             except Exception as e:
-                print(f"[Camera] 连接错误: {e}")
-                time.sleep(1)
-
-    except KeyboardInterrupt:
-        log_crash("用户主动 Ctrl+C 停止")
-        raise
-    except SystemExit as e:
-        log_crash(f"系统主动退出 (code={e.code})")
-        raise
-    except BaseException as e:
-        log_crash("异常崩溃", sys.exc_info())
-        raise
+                print(f"[Camera] 发送失败: {e}")
+                break
     finally:
-        print("\n[Camera] 正在停止摄像头...")
-        picam2.stop()
+        print("[Camera] 正在停止")
+        cam.stop()
         server_socket.close()
-        print("[Camera] 服务已退出")
-
+        if "client_socket" in locals():
+            client_socket.close()
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

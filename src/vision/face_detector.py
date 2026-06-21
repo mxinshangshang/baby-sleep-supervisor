@@ -410,12 +410,17 @@ class FaceDetector:
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        # Open mouth often appears as a darker, moderately saturated region.
+        # Open mouth often appears as a darker region.
         v = hsv[:, :, 2]
         s = hsv[:, :, 1]
         dark = v < max(45, np.percentile(v, 28))
-        saturated = s > 25
-        mask = (dark & saturated).astype(np.uint8) * 255
+        # 自适应饱和度阈值：灰度画面（夜视）跳过饱和度过滤
+        mean_s = float(np.mean(s))
+        if mean_s >= 12.0:
+            saturated = s > 25
+            mask = (dark & saturated).astype(np.uint8) * 255
+        else:
+            mask = dark.astype(np.uint8) * 255
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

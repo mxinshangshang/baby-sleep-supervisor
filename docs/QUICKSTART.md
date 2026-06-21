@@ -1,4 +1,4 @@
-# 快速上手指南 - 5分钟从零到运行
+# 快速上手指南
 
 ---
 
@@ -42,8 +42,8 @@ cd /home/mxin/.openclaw/workspace/baby_sleep_supervisor
 7. 位置满意后 → **按 `s` 保存**
 
 8. 最后一步：选择需要飞书通知的告警类型
-   - 用**上下箭头**移动光标
-   - **空格**勾选/取消
+   - 鼠标点击或按数字键 1-7 勾选/取消
+   - `a` 全选，`n` 全不选
    - **Enter** 或 **s** 确认保存
 
 ✅ 区域配置完成！
@@ -61,10 +61,13 @@ notification:
 
   # 勾选你需要的通知类型
   enabled_alert_types:
-    - cry_detected      # 哭闹
-    - occlusion_detected  # 遮挡
-    - region_exit       # 离开区域
-    # - region_enter    # 进入区域（一般不需要）
+    - cry_detected        # 哭闹
+    - occlusion_detected  # 口鼻遮挡
+    - limb_exposure       # 踢被子/肢体裸露
+    - region_exit         # 离开安全区域
+    - region_enter        # 进入安全区域
+    - prone_detected      # 趴睡风险
+    - face_not_visible    # 面部不可见
 ```
 
 ---
@@ -78,7 +81,7 @@ notification:
 ```
 
 你会看到：
-- 实时视频画面
+- 实时视频画面（暗光自动切换夜视摄像头）
 - 彩色检测框
 - 左上角状态数值
 - 右下角快捷键帮助
@@ -88,7 +91,7 @@ notification:
 ### 方式B：生产部署 - 无头模式
 
 ```bash
-./start_headless.sh
+/usr/bin/python3 main.py -n
 ```
 
 纯后台运行，不显示窗口，资源占用更低。
@@ -116,43 +119,39 @@ ps aux | grep python
 ### 检查日志
 
 ```bash
-# 实时查看输出
-tail -f nohup.out  # 无头模式
+# 摄像头服务器日志（含双摄切换记录）
+tail -f /tmp/camera_server.log
+
+# 主进程 + 推理客户端日志
+tail -f /tmp/baby_preview.log
 ```
 
 正常输出示例：
 ```
-[Main] 启动摄像头服务器...
-[Main] 摄像头服务器 PID: 12345
-[Main] 等待摄像头初始化...
-[Main] 启动推理客户端...
-[Main] 推理客户端 PID: 12346
-[Main] 两个进程都已启动，按 Ctrl+C 退出
+[Camera] CameraRouter初始化完成（双摄模式）
+[Camera] 服务器启动，等待客户端连接: 127.0.0.1:65433
 
-运行中... preview_fps=14.8 infer_fps=2.9 target_infer=3.0 camera_seq=1234
+运行中... preview_fps=10.0 infer_fps=3.0 camera_seq=1234 temp=68.8C
 ```
 
 ---
 
 ## 常见问题速查
 
-### Q: 启动后黑屏 / 没有画面？
+### Q: 启动后画面全黑？
 
-**A**: 检查摄像头占用
-```bash
-# 杀掉所有可能占用摄像头的进程
-pkill -f python
-pkill -f libcamera
-
-# 重新启动
-./start.sh
+**A**: 暗光环境下常规摄像头拍出来是黑的，系统会自动切换夜视摄像头。首次切换约需 14 秒（`stable_frames=7` × 每 30 帧检测一次）。查看 `/tmp/camera_server.log` 确认切换日志：
 ```
+亮度=0.002 active=0 dark=7/7 → 切换完成 0 -> 1
+```
+
+### Q: 双摄没有生效？
+
+**A**: 确认 `config.yaml` 中 `dual_camera.enabled: true`。检查 `/tmp/camera_server.log` 是否有 `CameraRouter初始化完成（双摄模式）`。
 
 ### Q: 检测框一直不出现？
 
-**A**: 确认宝宝在画面中央，调整角度让脸部和身体都可见。
-
-MediaPipe 需要一定的清晰度和角度才能检测到关键点。
+**A**: 确认宝宝在画面中央，调整角度让脸部和身体都可见。MediaPipe 需要一定的清晰度和角度才能检测到关键点。
 
 ### Q: 误报太多？哭闹太灵敏？
 
@@ -160,12 +159,9 @@ MediaPipe 需要一定的清晰度和角度才能检测到关键点。
 
 ```yaml
 detection:
-  # 哭闹 - 调大数值降低灵敏度
   cry_confidence_threshold: 0.6    # 从0.5调到0.6或0.7
   cry_duration_threshold: 3.0      # 从2秒调到3秒
-
-  # 遮挡 - 调大数值降低灵敏度
-  occlusion_threshold: 0.7
+  occlusion_threshold: 0.85        # 从0.75调高
 ```
 
 ### Q: 漏报？哭闹没检测到？
@@ -196,17 +192,24 @@ inference:
   inference_fps: 2  # 从3降到2，CPU降约30%
 ```
 
-### Q: 怎么看历史事件？
+### Q: 怎么看历史事件和回溯分析？
 
 ```bash
-# 查看SQLite数据库
-sqlite3 data/events.db
-
-# 查询最近10条事件
+# 查看告警事件
 sqlite3 data/events.db "SELECT * FROM events ORDER BY timestamp DESC LIMIT 10;"
+
+# 查看诊断快照（用于回溯分析历史误报/漏报）
+sqlite3 data/events.db "SELECT timestamp, json_extract(snapshot_json, '$.alerts') FROM events_debug WHERE timestamp BETWEEN '2026-06-19 17:12:00' AND '2026-06-19 17:14:00';"
 
 # 查看抓拍照片
 ls -la data/photos/
+```
+
+### Q: 如何手动切换摄像头？
+
+```bash
+# 发送 SIGUSR2 给 camera_server 强制切换
+kill -USR2 $(pgrep -f camera_server.py)
 ```
 
 ---
@@ -231,7 +234,7 @@ ps -eo pid,etime,cmd | grep python | grep -v grep
 ```bash
 pkill -f "python3.*main.py"
 sleep 2
-./start_headless.sh
+./start.sh
 ```
 
 ### 清理旧数据

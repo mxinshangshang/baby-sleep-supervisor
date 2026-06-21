@@ -47,7 +47,7 @@ class SleepSupervisor:
         self.storage = Storage()
 
         # 检测阈值
-        self.cry_threshold = detection_cfg.get("cry_confidence_threshold", 0.25)  # 临时调低测试，正常应0.5-0.7
+        self.cry_threshold = detection_cfg.get("cry_confidence_threshold", 0.5)
         self.cry_duration_threshold = detection_cfg.get("cry_duration_threshold", 1.5)  # 哭声持续时间阈值（秒）
         self.exposure_threshold = detection_cfg.get("exposure_threshold", 0.3)
         self.occlusion_threshold = detection_cfg.get("occlusion_threshold", 0.6)
@@ -70,6 +70,9 @@ class SleepSupervisor:
 
         # 趴睡检测
         self.prone_enabled = detection_cfg.get("prone_detection_enabled", True)
+
+        # 人脸不可见状态（兼容旧代码 + 新帧计数逻辑）
+        self.face_absence_start_time: Optional[float] = None
 
         # =================================================================
         # 【统一帧防抖】所有视频监控项默认3帧确认，差异化修改直接改各变量值即可
@@ -917,7 +920,7 @@ class SleepSupervisor:
                         message="头脸区域不可见，请确认口鼻安全",
                         photo_path=photo_path,
                         details={
-                            "持续时间": f"{duration:.1f}s",
+                            "确认帧数": f"{self.face_absence_frames}帧",
                             "事件ID": event_id,
                             **self._build_alert_context(audio_features),
                         }
@@ -925,7 +928,7 @@ class SleepSupervisor:
                     results["events"].append({
                         "type": "face_not_visible",
                         "level": "warning",
-                        "duration_s": duration,
+                        "frames": self.face_absence_frames,
                         "event_id": event_id,
                         "photo_path": photo_path
                     })
@@ -996,7 +999,7 @@ class SleepSupervisor:
                     results["events"].append({
                         "type": "prone_detected",
                         "level": "danger",
-                        "duration_s": prone_dur,
+                        "frames": self.prone_frames,
                         "event_id": event_id,
                         "photo_path": photo_path
                     })
@@ -1075,7 +1078,7 @@ class SleepSupervisor:
                         })
                 else:
                     self.cry_start_time = None
-            elif in_region and self.audio_enabled and audio_features and audio_features.cry_confidence >= 0.15:  # 宝宝在哭，调低阈值测试
+            elif in_region and self.audio_enabled and audio_features and audio_features.cry_confidence >= 0.15:
                 # 场景2：in_region 但 landmarks 不可用 / presence 未确认（盖被子/侧脸场景）
                 # 降级评估：音频 + 动作，不用人脸表情
                 motion_confidence = float(motion_features.get("agitation", 0.0))
@@ -1099,11 +1102,11 @@ class SleepSupervisor:
                     },
                     "fused": True
                 }
-                if smoothed_cry >= 0.35:  # 调低阈值测试，宝宝在哭
+                if smoothed_cry >= self.cry_threshold:
                     self.last_cry_confidence = smoothed_cry
                     self.last_cry_time = now
                 # 音频为主的降级模式，用时间防抖（音频独立）
-                if smoothed_cry >= 0.35:
+                if smoothed_cry >= self.cry_threshold:
                     if self.cry_start_time is None:
                         self.cry_start_time = now
                     elif now - self.cry_start_time >= 1.5 and self._should_alert("cry_detected"):
@@ -1341,10 +1344,10 @@ class SleepSupervisor:
                         # 帧计数衰减，允许波动
                         self.exposure_frames = max(0, self.exposure_frames - 1)
                     
-                    if self.exposure_frames >= self.exposure_confirm_frames and self._should_alert("limb_exposure_detected"):
+                    if self.exposure_frames >= self.exposure_confirm_frames and self._should_alert("limb_exposure"):
                         photo_path = self.storage.save_photo(frame, now)
                         event_id = self.storage.save_event(
-                            event_type="limb_exposure_detected",
+                            event_type="limb_exposure",
                             level="warning",
                             message=f"检测到肢体裸露/踢被子，裸露比例 {smoothed_exposure:.2f}",
                             details=exposure_features,
@@ -1352,7 +1355,7 @@ class SleepSupervisor:
                         )
                         mode_text = "（盖被子/侧脸模式）" if coverage_status == "degraded_mode_blanket_side_face" else ""
                         self.notifier.send_alert(
-                            event_type="limb_exposure_detected",
+                            event_type="limb_exposure",
                             level="warning",
                             message=f"婴儿肢体裸露/踢被子{mode_text}",
                             photo_path=photo_path,
@@ -1363,7 +1366,7 @@ class SleepSupervisor:
                             }
                         )
                         results["events"].append({
-                            "type": "limb_exposure_detected",
+                            "type": "limb_exposure",
                             "level": "warning",
                             "confidence": smoothed_exposure,
                                 "event_id": event_id,
