@@ -447,7 +447,21 @@ def main():
                     flush=True,
                 )
 
-            time.sleep(0.001)
+            # 计算需要休眠多久到下一个事件点
+            next_event = float('inf')
+            if not no_preview and renderer is not None:
+                next_event = min(next_event, next_preview_time)
+
+            # 如果没有预览事件，就休眠较长时间（无头模式）
+            now = time.time()
+            if next_event == float('inf'):
+                # 无头模式下，没有UI要刷新，只需偶尔检查状态即可
+                time.sleep(0.05)  # 50ms
+            elif next_event > now:
+                sleep_time = max(0.002, min(0.03, next_event - now))  # 最多30ms，至少2ms
+                time.sleep(sleep_time)
+            else:
+                time.sleep(0.002)  # 已经过期了，稍微休眠一点避免CPU 100%
 
     except KeyboardInterrupt:
         log_crash("用户主动 Ctrl+C 停止")
