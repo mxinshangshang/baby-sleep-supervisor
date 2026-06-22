@@ -9,7 +9,7 @@ from typing import Tuple, List, Dict, Optional
 
 
 class BodyDetector:
-    def __init__(self, min_detection_confidence: float = 0.5, model_complexity: int = 1):
+    def __init__(self, min_detection_confidence: float = 0.7, model_complexity: int = 1):
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
@@ -17,7 +17,7 @@ class BodyDetector:
             smooth_landmarks=True,
             enable_segmentation=True,
             min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.6
         )
 
         # 关键点索引
@@ -38,11 +38,12 @@ class BodyDetector:
         self.lower_skin = np.array([0, 20, 70], dtype=np.uint8)
         self.upper_skin = np.array([20, 255, 255], dtype=np.uint8)
 
-    def detect_pose(self, frame: np.ndarray) -> Optional[Dict]:
+    def detect_pose(self, frame: np.ndarray, rgb_frame: Optional[np.ndarray] = None) -> Optional[Dict]:
         """检测人体姿态
         返回包含关键点、分割掩码等信息的字典
         """
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if rgb_frame is None:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.pose.process(rgb_frame)
 
         if not results.pose_landmarks:

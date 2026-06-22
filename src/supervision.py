@@ -28,7 +28,7 @@ class SleepSupervisor:
             min_detection_confidence=self.config["inference"].get("min_detection_confidence", 0.5)
         )
         self.body_detector = BodyDetector(
-            min_detection_confidence=self.config["inference"].get("min_detection_confidence", 0.5),
+            min_detection_confidence=self.config["inference"].get("min_detection_confidence", 0.7),
             model_complexity=self.config["inference"].get("model_complexity", 1)
         )
         self.region_detector = RegionDetector()
@@ -82,15 +82,16 @@ class SleepSupervisor:
         # 各监控项独立确认帧数（都默认等于统一常量）
         self.occlusion_confirm_frames: int = self.CONFIRM_FRAMES    # 遮挡检测
         self.exposure_confirm_frames: int = self.CONFIRM_FRAMES     # 肢体裸露/踢被子
-        self.prone_confirm_frames: int = self.CONFIRM_FRAMES        # 趴睡检测
+        self.prone_confirm_frames: int = 8         # 趴睡检测（需要更长时间确认，区分侧睡）
         self.face_absence_confirm_frames: int = self.CONFIRM_FRAMES # 人脸不可见
-        self.region_confirm_frames: int = self.CONFIRM_FRAMES        # 区域进入/离开
+        self.region_confirm_frames: int = detection_cfg.get("region_confirm_frames", self.CONFIRM_FRAMES)  # 区域进入/离开
 
         # 各监控项独立帧计数器（纯视觉检测用帧计数）
         self.occlusion_frames: int = 0                               # 遮挡帧计数
         self.exposure_frames: int = 0                                # 肢体裸露帧计数
         self.prone_frames: int = 0                                   # 趴睡帧计数
-        self.face_absence_frames: int = 0                            # 人脸不可见帧计数
+        self.face_absence_frames: int = 0
+        self.prone_face_missing_frames: int = 0                            # 人脸不可见帧计数
         self.region_exit_frames: int = 0                             # 区域离开帧计数
         self.region_enter_frames: int = 0                            # 区域进入帧计数
 
@@ -112,8 +113,8 @@ class SleepSupervisor:
         self.distress_duration_threshold = detection_cfg.get("distress_duration_threshold", 1.5)
 
         # 平滑窗口
-        self.cry_confidence_window = deque(maxlen=10)
-        self.exposure_ratio_window = deque(maxlen=10)
+        self.cry_confidence_window = deque(maxlen=6)
+        self.exposure_ratio_window = deque(maxlen=6)
         # Reduced window from 10 → 4 frames (≈2 seconds at 2fps) to avoid
         # ghost alarms: a transient high score 5 seconds ago should not
         # keep triggering alerts long after the occluder (hand/blanket) has moved away.
@@ -121,8 +122,8 @@ class SleepSupervisor:
         self.occlusion_confidence_window = deque(maxlen=4)
         self.presence_score_window = deque(maxlen=detection_cfg.get("presence_window_size", 8))
         self.region_exit_window = deque(maxlen=detection_cfg.get("region_exit_window_size", 8))
-        self.head_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 12))
-        self.limb_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 12))
+        self.head_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 8))
+        self.limb_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 8))
 
         # 手部检测缓存：FaceMesh可用时每1秒跑一次，不可用时每帧跑
         self.hands_cache: List[Dict] = []
@@ -135,8 +136,8 @@ class SleepSupervisor:
         self.distress_window = deque(maxlen=detection_cfg.get("distress_window_size", 6))
         self.prev_mouth_open_score: Optional[float] = None
         self.mouth_variation_window = deque(maxlen=detection_cfg.get("mouth_variation_window_size", 6))
-        self.cry_temporal_window = deque(maxlen=detection_cfg.get("cry_temporal_window_size", 10))
-        self.mouth_pulse_window = deque(maxlen=detection_cfg.get("mouth_pulse_window_size", 10))
+        self.cry_temporal_window = deque(maxlen=detection_cfg.get("cry_temporal_window_size", 6))
+        self.mouth_pulse_window = deque(maxlen=detection_cfg.get("mouth_pulse_window_size", 6))
         self.prev_mouth_trend: Optional[int] = None
         self.prev_motion_points: Optional[Dict] = None
         self.last_confirmed_presence_time = 0.0
@@ -228,6 +229,107 @@ class SleepSupervisor:
             return None
         return ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
 
+    def _validate_pose_geometry(self, landmarks) -> bool:
+        """验证姿态关键点的几何合理性，防止误检到毯子/玩具上。
+
+        基于 MediaPipe Pose 特性设计：
+        - MediaPipe Pose 对躯干结构的检测相对稳定
+        - 我们主要检查肩-髋的几何关系是否合理
+        - 不做过度严格的比例限制，适应婴儿不同睡姿
+        """
+        # MediaPipe Pose 关键点索引
+        LEFT_SHOULDER = 11
+        RIGHT_SHOULDER = 12
+        LEFT_HIP = 23
+        RIGHT_HIP = 24
+
+        visibility_threshold = 0.5
+
+        # ============================================================
+        # 检查1：至少要有肩膀或髋部的检测
+        # ============================================================
+        ls_vis = landmarks[LEFT_SHOULDER][2] >= visibility_threshold
+        rs_vis = landmarks[RIGHT_SHOULDER][2] >= visibility_threshold
+        lh_vis = landmarks[LEFT_HIP][2] >= visibility_threshold
+        rh_vis = landmarks[RIGHT_HIP][2] >= visibility_threshold
+        visible_count = sum([ls_vis, rs_vis, lh_vis, rh_vis])
+
+        if visible_count < 2:
+            return False  # 关键点太少，不可信
+
+        # ============================================================
+        # 检查2：如果肩膀和髋部都有检测，检查躯干结构的合理性
+        # ============================================================
+        has_left_shoulder = ls_vis
+        has_right_shoulder = rs_vis
+        has_left_hip = lh_vis
+        has_right_hip = rh_vis
+
+        if has_left_shoulder and has_right_shoulder and has_left_hip and has_right_hip:
+            # 获取四个点的坐标
+            ls = np.array([landmarks[LEFT_SHOULDER][0], landmarks[LEFT_SHOULDER][1]])
+            rs = np.array([landmarks[RIGHT_SHOULDER][0], landmarks[RIGHT_SHOULDER][1]])
+            lh = np.array([landmarks[LEFT_HIP][0], landmarks[LEFT_HIP][1]])
+            rh = np.array([landmarks[RIGHT_HIP][0], landmarks[RIGHT_HIP][1]])
+
+            # 计算肩宽和髋宽
+            shoulder_width = np.linalg.norm(ls - rs)
+            hip_width = np.linalg.norm(lh - rh)
+
+            # 计算躯干长度（肩中点到髋中点）
+            shoulder_center = (ls + rs) / 2
+            hip_center = (lh + rh) / 2
+            torso_length = np.linalg.norm(shoulder_center - hip_center)
+
+            # ============================================================
+            # 合理的躯干结构检查
+            # ============================================================
+            # 1. 躯干不能太短
+            if torso_length < 20:  # 像素阈值，适应不同分辨率
+                return False
+
+            # 2. 肩宽和髋宽应该在合理比例范围内 (0.5 ~ 2.0)
+            # 婴儿各种睡姿下这个比例都不会太极端
+            if hip_width > 0:
+                shoulder_hip_ratio = shoulder_width / hip_width
+                if shoulder_hip_ratio < 0.3 or shoulder_hip_ratio > 3.0:
+                    return False
+
+            # 3. 肩宽和髋宽都应该显著小于躯干长度
+            # 躺在床上时，躯干（肩到髋）应该比肩宽/髋宽要长
+            if shoulder_width > 0 and hip_width > 0:
+                max_width = max(shoulder_width, hip_width)
+                if max_width > torso_length * 2.5:  # 放宽到2.5倍，适应侧身
+                    return False
+
+            # 4. 四个点应该形成一个大致的梯形/四边形，而不是杂乱分布
+            # 检查左右两边是否大致对称
+            left_side_len = np.linalg.norm(ls - lh)
+            right_side_len = np.linalg.norm(rs - rh)
+            if left_side_len > 0 and right_side_len > 0:
+                side_ratio = min(left_side_len, right_side_len) / max(left_side_len, right_side_len)
+                if side_ratio < 0.25:  # 左右边长度差异太大，可能是误检
+                    return False
+
+        # ============================================================
+        # 检查3：关键点置信度分布检查（一次遍历完成）
+        # MediaPipe Pose 误检时，通常很多点的置信度都刚过门槛
+        # ============================================================
+        high_conf_count = 0
+        has_good_point = False
+        for i in range(33):
+            conf = landmarks[i][2]
+            if conf >= 0.8:
+                high_conf_count += 1
+            if conf >= 0.7:
+                has_good_point = True
+
+        if high_conf_count == 0 and not has_good_point:
+            return False
+
+        # 通过所有检查
+        return True
+
     def _summarize_pose(self, pose_data: Optional[Dict], frame_shape: Tuple[int, int, int]) -> Dict:
         summary = {
             "available": False,
@@ -243,18 +345,32 @@ class SleepSupervisor:
             "head_center": None,
             "quality": 0.0,
             "segmentation_available": False,
+            "geometry_valid": False,
         }
         if not pose_data:
             return summary
 
         landmarks = pose_data["landmarks"]
-        visible = [(lm[0], lm[1]) for lm in landmarks if lm[2] >= self.pose_visibility_threshold]
-        head_indices = list(range(0, 11))
-        torso_indices = [11, 12, 23, 24]
-        core_indices = head_indices + torso_indices
-        head_points = [(landmarks[i][0], landmarks[i][1]) for i in head_indices if landmarks[i][2] >= self.pose_visibility_threshold]
-        torso_points = [(landmarks[i][0], landmarks[i][1]) for i in torso_indices if landmarks[i][2] >= self.pose_visibility_threshold]
-        core_landmarks = sum(1 for i in core_indices if landmarks[i][2] >= self.pose_visibility_threshold)
+        # ============================================================
+        # 一次遍历完成：visible + head_points + torso_points + core_landmarks
+        # ============================================================
+        head_indices = set(range(0, 11))
+        torso_indices_set = {11, 12, 23, 24}
+        visible = []
+        head_points = []
+        torso_points = []
+        core_landmarks = 0
+
+        for i, lm in enumerate(landmarks):
+            if lm[2] >= self.pose_visibility_threshold:
+                pt = (lm[0], lm[1])
+                visible.append(pt)
+                if i in head_indices:
+                    head_points.append(pt)
+                    core_landmarks += 1
+                elif i in torso_indices_set:
+                    torso_points.append(pt)
+                    core_landmarks += 1
 
         body_bbox = self._bbox_from_points(visible, frame_shape, self.pose_bbox_padding_px)
         torso_bbox = self._bbox_from_points(torso_points, frame_shape, self.pose_bbox_padding_px)
@@ -263,18 +379,29 @@ class SleepSupervisor:
         torso_area = self._bbox_area(torso_bbox)
         segmentation_available = pose_data.get("segmentation_mask") is not None and np.sum(pose_data["segmentation_mask"] > 0) > 500
 
+        # ============================================================
+        # 【几何合理性校验】：检查关键点是否组成合理的人形结构
+        # 防止误检到毯子、玩具等非人物体上
+        # ============================================================
+        geometry_valid = self._validate_pose_geometry(landmarks)
+
         score = 0.0
         if len(visible) >= self.pose_min_visible_landmarks and body_area >= self.pose_min_body_bbox_area:
-            score += 0.35
-        if core_landmarks >= self.pose_min_core_landmarks:
             score += 0.30
+        if core_landmarks >= self.pose_min_core_landmarks:
+            score += 0.25
         if torso_area >= self.pose_min_torso_bbox_area or head_bbox:
             score += 0.20
         if segmentation_available:
-            score += 0.15
+            score += 0.10
+        if geometry_valid:
+            score += 0.15  # 几何合理是强信号
+
+        # 姿态可用条件：score >= 0.35 且 几何合理
+        is_available = score >= 0.35 and geometry_valid
 
         summary.update({
-            "available": score > 0,
+            "available": is_available,
             "visible_landmarks": len(visible),
             "core_landmarks": core_landmarks,
             "body_bbox": body_bbox,
@@ -287,6 +414,7 @@ class SleepSupervisor:
             "head_center": self._bbox_center(head_bbox),
             "quality": min(1.0, score),
             "segmentation_available": segmentation_available,
+            "geometry_valid": geometry_valid,
         })
         return summary
 
@@ -340,12 +468,12 @@ class SleepSupervisor:
         # ============================================================
         # 【姿态与人脸独立确认机制】
         # 核心思想：正睡靠Pose，侧睡靠Face，两者只要一个够强就算有人
-        # - Pose 质量 >= 0.4 → 姿态确认
+        # - Pose 质量 >= 0.65 且 几何有效 → 姿态确认（更严格，过滤其他物体误检）
         # - Face 质量 >= 0.5 → 人脸确认（侧睡场景）
         # 避免：侧睡时Pose弱被误判为无人，同时过滤无Face的纯Pose误检
         # ============================================================
-        pose_confirmed = pose_quality >= 0.40
-        face_confirmed = face_quality >= 0.50
+        pose_confirmed = pose_quality >= 0.65 and pose_summary.get("geometry_valid", False)
+        face_confirmed = face_quality >= 0.50  # 侧睡/盖被子时人脸仍可确认
         has_valid_confirmation = pose_confirmed or face_confirmed
 
         if has_valid_confirmation:
@@ -776,17 +904,20 @@ class SleepSupervisor:
         }
         in_region = True  # 默认值，区域检测启用时会被覆盖
 
+        # 统一做一次 BGR→RGB 转换，避免重复计算
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
         if self.cry_enabled or self.occlusion_enabled:
             if self._last_facemesh_ok and now - self.face_detector.last_face_detect_time < self.face_detector.face_detect_interval_s:
                 faces = self.face_detector.last_face_detect_result
             else:
-                faces = self.face_detector.detect_faces(frame)
+                faces = self.face_detector.detect_faces(frame, rgb_frame)
                 self.face_detector.last_face_detect_result = faces
                 self.face_detector.last_face_detect_time = now
         else:
             faces = []
         hands = []
-        pose_data = self.body_detector.detect_pose(frame) if (self.exposure_enabled or self.region_enabled) else None
+        pose_data = self.body_detector.detect_pose(frame, rgb_frame) if (self.exposure_enabled or self.region_enabled) else None
         pose_summary = self._summarize_pose(pose_data, frame.shape)
         if self.occlusion_enabled and pose_summary.get("head_bbox"):
             should_detect_hands = (
@@ -794,12 +925,12 @@ class SleepSupervisor:
                 or now - self.hands_cache_time >= self.hands_detect_interval_s
             )
             if should_detect_hands:
-                hands = self.face_detector.detect_hands_near_head(frame, pose_summary.get("head_bbox"))
+                hands = self.face_detector.detect_hands_near_head(frame, pose_summary.get("head_bbox"), rgb_frame)
                 self.hands_cache = hands
                 self.hands_cache_time = now
             else:
                 hands = self.hands_cache
-        landmarks = self.face_detector.detect_face_landmarks(frame, pose_summary.get("head_bbox")) if (self.cry_enabled or self.occlusion_enabled) else None
+        landmarks = self.face_detector.detect_face_landmarks(frame, pose_summary.get("head_bbox"), rgb_frame) if (self.cry_enabled or self.occlusion_enabled) else None
         self._last_facemesh_ok = landmarks is not None
         face_pose = self.face_detector.classify_face_orientation(landmarks)
         face_summary = self._summarize_face(faces, landmarks)
@@ -835,20 +966,13 @@ class SleepSupervisor:
 
         # ============================================================
         # 【先定义 in_region 和 region_status 变量，避免后面使用时未定义】
-        # 默认 True：检测块（面部缺失/趴睡/哭闹场景2/遮挡/踢被子）依赖 in_region，
-        # 但它们都在区域检测（1387行）之前执行。区域检测会在后面计算真实值，
-        # 用于纯音频通道（1662行）和下一帧。1帧滞后 @3fps ≈ 333ms 可忽略。
+        # 使用上一帧的区域计算结果。检测块（面部缺失/趴睡/哭闹场景2/遮挡/踢被子）
+        # 都在区域检测之前执行，无法使用当前帧的 in_region。
+        # 1帧滞后 @3fps ≈ 333ms 可忽略。
         # ============================================================
-        in_region = True
-        region_status = "in_region"
-        decision_basis = presence.get("reason", "unknown")
-        body_overlap = 0.0
-        torso_overlap = 0.0
-        body_center_in_region = False
-        torso_center_in_region = False
-        head_center_in_region = False
-        face_center_in_region = False
-        face_bbox = face_summary.get("main_face_bbox")
+        prev_region = (self.last_results or {}).get("detections", {}).get("region", {})
+        in_region = prev_region.get("in_region", True)
+        region_status = prev_region.get("status", "in_region")
 
         results["detections"]["faces"] = faces
         results["detections"]["hands"] = hands
@@ -936,6 +1060,7 @@ class SleepSupervisor:
                     })
             else:
                 self.face_absence_start_time = None
+                self.face_absence_frames = max(0, self.face_absence_frames - 1)
                 results["detections"]["face_absence"] = {
                     "status": "visible" if face_visible else "no_confirmed_person",
                     "duration_s": 0.0,
@@ -944,29 +1069,55 @@ class SleepSupervisor:
 
         # ============================================================
         # 【趴睡检测】
-        # 2-3月龄婴儿无法自主翻身，面部朝下有窒息风险。
-        # 侧睡本身正常（家长可能刻意侧放），只有当头框可见但FaceMesh
-        # 持续检测不到面部关键点时，才高度怀疑面部朝下/埋入床垫。
+        # 核心信号：头框可见但FaceMesh/BlazeFace都检测不到面部。
+        # 但正常侧睡也会如此 → 必须用身体上下文排除侧睡。
+        #
+        # 排除侧睡的条件：
+        #   1. BlazeFace检测到侧脸bbox → 说明脸在侧面，不是朝下
+        #   2. 上次已知姿势是侧睡 → 延续判断
+        #   3. 身体轴线接近水平 → 侧睡特征（头在左/右，躯干横向）
+        #   4. 手部靠近头部 → 可能是遮挡而非趴睡
+        #
+        # 趴睡特征：轴线接近垂直（头在上、躯干在下，背部朝上）
         # ============================================================
         if self.prone_enabled and presence["confirmed"] and in_region:
             posture = baby_topology.get("posture", "unknown")
             face_landmarks_ok = face_summary.get("landmarks_available", False)
+            face_mode = face_summary.get("mode", "")
             head_bbox_exists = bool(baby_topology.get("head_bbox") or pose_summary.get("head_bbox"))
+            axis_angle = baby_topology.get("axis_angle")
+            axis_confidence = baby_topology.get("axis_confidence", 0)
 
-            if head_bbox_exists and not face_landmarks_ok:
-                self.face_mesh_absence_start_time = now  # 保留兼容
-                self.face_absence_frames += 1  # 帧计数
+            # 排除侧睡：BlazeFace看到了侧脸 → 脸在侧面，不是朝下
+            side_face_detected = (face_mode == "bbox_only_possible_side_face")
+            # 排除侧睡：上次已知姿势
+            known_side_lying = (posture == "side_lying")
+            # 排除侧睡：身体轴线接近水平（|angle| < 30° 或 > 150° 或 |angle-180| < 30）
+            axis_is_horizontal = (
+                axis_angle is not None and axis_confidence >= 0.55 and
+                (abs(axis_angle) < 30 or abs(axis_angle) > 150 or abs(abs(axis_angle) - 180) < 30)
+            )
+            # 排除：手部靠近头部（可能是遮挡）
+            hands_near_head = len(baby_topology.get("nearby_hands", [])) > 0
+
+            likely_side_sleeping = side_face_detected or known_side_lying or axis_is_horizontal or hands_near_head
+
+            if head_bbox_exists and not face_landmarks_ok and not likely_side_sleeping:
+                self.face_mesh_absence_start_time = now
+                self.prone_face_missing_frames += 1
             else:
                 self.face_mesh_absence_start_time = None
-                self.face_absence_frames = max(0, self.face_absence_frames - 1)  # 衰减
+                self.prone_face_missing_frames = max(0, self.prone_face_missing_frames - 1)
 
             prone_suspected = False
             prone_reason = ""
 
-            # 头框可见但FaceMesh持续不可用 → 高度怀疑面部朝下/埋入床垫
-            if head_bbox_exists and not face_landmarks_ok and self.face_absence_frames >= self.face_absence_confirm_frames:
-                prone_suspected = True
-                prone_reason = f"head_visible_face_mesh_missing_{self.face_absence_frames}frames"
+            if head_bbox_exists and not face_landmarks_ok and self.prone_face_missing_frames >= self.face_absence_confirm_frames:
+                if likely_side_sleeping:
+                    prone_reason = f"mesh_missing_but_likely_side_sleeping"
+                else:
+                    prone_suspected = True
+                    prone_reason = f"head_visible_face_mesh_missing_{self.prone_face_missing_frames}frames"
 
             if prone_suspected:
                 self.prone_frames += 1
@@ -975,15 +1126,18 @@ class SleepSupervisor:
                     "frames": self.prone_frames,
                     "reason": prone_reason,
                     "posture": posture,
+                    "axis_angle": axis_angle,
+                    "side_face_detected": side_face_detected,
+                    "axis_is_horizontal": axis_is_horizontal,
+                    "hands_near_head": hands_near_head,
                 }
-                # 【统一帧防抖】3帧确认后触发告警
                 if self.prone_frames >= self.prone_confirm_frames and self._should_alert("prone_detected"):
                     photo_path = self.storage.save_photo(frame, now)
                     event_id = self.storage.save_event(
                         event_type="prone_detected",
                         level="danger",
                         message=f"疑似面部朝下（趴睡风险），已确认 {self.prone_frames} 帧",
-                        details={"posture": posture, "reason": prone_reason, "face_mesh_absence_frames": self.face_absence_frames},
+                        details={"posture": posture, "reason": prone_reason, "face_mesh_absence_frames": self.prone_face_missing_frames},
                         photo_path=photo_path
                     )
                     self.notifier.send_alert(
@@ -1007,14 +1161,20 @@ class SleepSupervisor:
                     })
             else:
                 self.prone_start_time = None
+                self.prone_frames = max(0, self.prone_frames - 1)  # 衰减
                 results["detections"]["prone"] = {
                     "status": "normal",
                     "duration_s": 0.0,
                     "reason": f"posture_{posture}_face_landmarks_{'ok' if face_landmarks_ok else 'missing'}",
+                    "side_face_detected": side_face_detected,
+                    "axis_is_horizontal": axis_is_horizontal,
+                    "hands_near_head": hands_near_head,
+                    "axis_angle": axis_angle,
                 }
         elif self.prone_enabled:
             self.prone_start_time = None
             self.face_mesh_absence_start_time = None
+            self.prone_face_missing_frames = max(0, self.prone_face_missing_frames - 1)
 
         if self.cry_enabled:
             # 场景1：有人脸关键点 → 完整多模态融合（表情 + 动作 + 音频）
@@ -1388,31 +1548,26 @@ class SleepSupervisor:
 
         if self.region_enabled:
             in_region = False  # 重新计算，覆盖默认值
-            region_status = "out_of_region"
             decision_basis = presence["reason"]
             body_overlap = 0.0
             torso_overlap = 0.0
             body_center_in_region = False
             torso_center_in_region = False
             head_center_in_region = False
+            face_center_in_region = False
+            face_bbox = face_summary.get("main_face_bbox")
+            face_center = self._bbox_center(face_bbox) if face_bbox else None
+            head_center = pose_summary.get("head_center") or self._bbox_center(face_bbox)
+            body_center = pose_summary.get("body_center")
+            torso_center = pose_summary.get("torso_center")
 
             # ============================================================
             # 【第一步：先计算所有检测到的部分和安全区的位置关系】
-            # 注意：不管 presence.confirmed 是 True 还是 False，都要计算
-            # 因为：就算只看到一只手/一个头，只要在安全区里，也应该算 in_region
             # ============================================================
-            body_bbox = pose_summary.get("body_bbox")
-            torso_bbox = pose_summary.get("torso_bbox")
-            head_bbox = pose_summary.get("head_bbox") or face_summary.get("main_face_bbox")
-            body_center = pose_summary.get("body_center")
-            torso_center = pose_summary.get("torso_center")
-            head_center = pose_summary.get("head_center") or self._bbox_center(face_summary.get("main_face_bbox"))
-            face_center = self._bbox_center(face_bbox) if face_bbox else None
-
-            if body_bbox:
-                body_overlap, _ = self.region_detector.bbox_overlap_with_region(body_bbox)
-            if torso_bbox:
-                torso_overlap, _ = self.region_detector.bbox_overlap_with_region(torso_bbox)
+            if pose_summary.get("body_bbox"):
+                body_overlap, _ = self.region_detector.bbox_overlap_with_region(pose_summary.get("body_bbox"))
+            if pose_summary.get("torso_bbox"):
+                torso_overlap, _ = self.region_detector.bbox_overlap_with_region(pose_summary.get("torso_bbox"))
             if body_center:
                 body_center_in_region = self.region_detector.point_in_region(body_center)
             if torso_center:
@@ -1424,15 +1579,7 @@ class SleepSupervisor:
 
             # ============================================================
             # 【第二步：根据位置比例关系判断 in/out】
-            # 核心原则：人脸是金标准 > 头 > 躯干 > 身体
-            # 盖被子场景：即使看不到身体，只要看到人脸就算在区里
-            # 无检测信号时：保持上一状态，防止抖动
             # ============================================================
-            body_thr = self.region_body_overlap_threshold
-            torso_thr = self.region_torso_overlap_threshold
-            body_loose_thr = max(0.20, body_thr - 0.15)
-            torso_loose_thr = max(0.20, torso_thr - 0.15)
-
             # 先判断有没有任何有效检测信号
             has_any_detection = (face_center is not None
                                 or head_center is not None
@@ -1443,54 +1590,33 @@ class SleepSupervisor:
             if not has_any_detection:
                 # 没有任何有效检测信号 → 保持上一帧状态，防止抖动
                 in_region = self.last_in_region if self.last_in_region is not None else False
-                region_status = "in_region" if in_region else "out_of_region"
                 decision_basis = "no_detection_signal_keep_previous_state"
             else:
                 # 有检测信号，按优先级判断
-
-                # ⭐ 优先级最高：人脸中心在区域内 → 金标准，直接判定在区域内
-                # 盖被子场景：即使看不到身体，只要看到人脸就算在区里
+                # ⭐ 优先级最高：人脸中心在区域内 → 金标准
                 if face_center_in_region:
                     in_region = True
-                    region_status = "in_region"
                     presence["confirmed"] = True  # 有脸就有人
                     decision_basis = "face_center_in_region_gold_standard"
-
-                # 优先级2：有脸但没身体（盖被子）+ 人脸在区内
-                elif face_bbox is not None and face_center_in_region:
-                    in_region = True
-                    region_status = "in_region"
-                    presence["confirmed"] = True  # 有脸就有人
-                    decision_basis = "face_only_under_blanket"
-
-                # 优先级3：头框中心在区域内 + 至少有少量重叠 → 姿态辅助佐证
+                # 优先级2：头框中心在区域内 + 至少有少量重叠
                 elif head_center_in_region and (body_overlap >= 0.20 or torso_overlap >= 0.20):
                     in_region = True
-                    region_status = "in_region"
                     decision_basis = "head_center_in_region_with_overlap"
-
-                # 优先级4：标准的躯干+身体双重阈值判断
-                elif torso_overlap >= torso_thr and body_overlap >= body_thr:
+                # 优先级3：标准的躯干+身体双重阈值判断
+                elif torso_overlap >= self.region_torso_overlap_threshold and body_overlap >= self.region_body_overlap_threshold:
                     in_region = True
-                    region_status = "in_region"
                     decision_basis = "torso_and_body_overlap"
-
-                # 优先级5：躯干中心 + 宽松身体重叠
-                elif torso_center_in_region and body_overlap >= body_loose_thr:
+                # 优先级4：躯干中心 + 宽松身体重叠
+                elif torso_center_in_region and body_overlap >= max(0.20, self.region_body_overlap_threshold - 0.15):
                     in_region = True
-                    region_status = "in_region"
                     decision_basis = "torso_center_plus_body"
-
-                # 优先级6：躯干重叠 + 身体中心在区域内
-                elif torso_overlap >= torso_loose_thr and body_center_in_region:
+                # 优先级5：躯干重叠 + 身体中心在区域内
+                elif torso_overlap >= max(0.20, self.region_torso_overlap_threshold - 0.15) and body_center_in_region:
                     in_region = True
-                    region_status = "in_region"
                     decision_basis = "torso_overlap_plus_center"
-
                 # 以上都不满足 → 判定不在区
                 else:
                     in_region = False
-                    region_status = "out_of_region"
                     decision_basis = "no_body_part_in_region"
 
             region_features = {
@@ -1498,7 +1624,7 @@ class SleepSupervisor:
                 "presence_score": presence["smoothed_score"],
                 "body_bbox": pose_summary.get("body_bbox"),
                 "torso_bbox": pose_summary.get("torso_bbox"),
-                "head_bbox": pose_summary.get("head_bbox") or face_summary.get("main_face_bbox"),
+                "head_bbox": pose_summary.get("head_bbox") or face_bbox,
                 "face_bbox": face_bbox,
                 "body_overlap_ratio": body_overlap,
                 "torso_overlap_ratio": torso_overlap,
@@ -1516,39 +1642,42 @@ class SleepSupervisor:
             }
             results["detections"]["region"] = {
                 "in_region": in_region,
-                "status": region_status,
+                "status": "in_region" if in_region else "out_of_region",
                 "features": region_features,
                 "exit_pending": False,
                 "exit_pending_s": 0.0,
             }
 
-            self.region_exit_window.append(not in_region and presence["confirmed"])
+            # 离开窗口：两种情况都算离开信号
+            # 1. 确认有人但不在区域
+            # 2. 完全没有检测信号（宝宝真的走了）
+            no_detection = not has_any_detection
+            self.region_exit_window.append((not in_region and presence["confirmed"]) or no_detection)
             exit_ratio = sum(1 for v in self.region_exit_window if v) / len(self.region_exit_window)
             confirmed_exit = (
-                presence["confirmed"]
-                and region_status == "out_of_region"
-                and exit_ratio >= self.region_exit_confirm_ratio
+                (presence["confirmed"] and not in_region and exit_ratio >= self.region_exit_confirm_ratio)
+                or
+                (no_detection and exit_ratio >= 0.8)  # 完全没信号时，更快确认离开
             )
             confirmed_in = (
                 presence["confirmed"]
-                and region_status == "in_region"
+                and in_region
                 and exit_ratio <= 0.5  # 进入和离开门槛一致
-                and body_overlap >= self.region_body_overlap_threshold  # 身体必须在区域内，防止空床误检
+                # 防止空床误检：只在靠身体判定时才要求 body_overlap
+                and (decision_basis in [
+                    "face_center_in_region_gold_standard",
+                    "head_center_in_region_with_overlap",
+                ] or body_overlap >= self.region_body_overlap_threshold)
             )
 
             # ============================================================
             # 【边缘触发 + 证据预缓存】区域事件通知
-            # 核心机制：
-            #   1. 刚检测到状态变化时 → 立即抓拍并缓存（事件发生瞬间的证据）
-            #   2. 防抖持续确认期间 → 持续验证状态稳定性
-            #   3. 确认后发送通知 → 用预缓存的照片，不是当前帧
-            # 效果：通知画面与事件发生瞬间 100% 同步，同时保留防抖能力
             # ============================================================
 
-            # 不在区域内：只清空离开相关的计时器和缓存
-            # 注意：不清空 enter 相关计时器，否则轻微抖动会导致永远无法完成进入确认
-            if region_status == "out_of_region":
+            # 不在区域内：清空离开和进入的缓存照片
+            if not in_region:
                 self.region_exit_candidate_photo = None
+                self.region_enter_candidate_photo = None  # 也清空进入的缓存，防止误用旧照片
                 # 初始化：如果 last_in_region 还是 None，说明是系统启动后首次判定
                 if self.last_in_region is None:
                     self.last_in_region = False

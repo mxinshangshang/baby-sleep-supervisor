@@ -103,9 +103,10 @@ class FaceDetector:
             })
         return faces
 
-    def detect_faces(self, frame: np.ndarray) -> List[Dict]:
+    def detect_faces(self, frame: np.ndarray, rgb_frame: Optional[np.ndarray] = None) -> List[Dict]:
         """检测人脸。用近距+远距两个 BlazeFace 模型互补，并去重。"""
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if rgb_frame is None:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         faces = []
         for detector, source in ((self.face_detection, "blazeface_near"), (self.face_detection_far, "blazeface_far")):
             results = detector.process(rgb_frame)
@@ -144,12 +145,13 @@ class FaceDetector:
         inv = cv2.invertAffineTransform(m)
         return rotated, inv
 
-    def _try_mesh(self, bgr_image: np.ndarray, roi_mode: bool = False) -> Optional[np.ndarray]:
-        rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    def _try_mesh(self, bgr_image: np.ndarray, rgb_image: Optional[np.ndarray] = None, roi_mode: bool = False) -> Optional[np.ndarray]:
+        if rgb_image is None:
+            rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
         detector = self.face_mesh_roi if roi_mode else self.face_mesh
-        return self._landmarks_from_results(detector.process(rgb), bgr_image.shape)
+        return self._landmarks_from_results(detector.process(rgb_image), bgr_image.shape)
 
-    def detect_face_landmarks(self, frame: np.ndarray, head_bbox=None) -> Optional[np.ndarray]:
+    def detect_face_landmarks(self, frame: np.ndarray, head_bbox=None, rgb_frame: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """检测人脸关键点。
 
         先跑全图 FaceMesh；失败后，如果姿态模型提供了 head_bbox，就对头部 ROI 进行
@@ -157,7 +159,7 @@ class FaceDetector:
         返回坐标始终映射回原图。
         """
         # 1) 全图常规检测，适合正脸/微侧脸。
-        full_landmarks = self._try_mesh(frame, roi_mode=False)
+        full_landmarks = self._try_mesh(frame, rgb_image=rgb_frame, roi_mode=False)
         if full_landmarks is not None:
             return full_landmarks
 
@@ -227,9 +229,10 @@ class FaceDetector:
             "mouth_nose_offset": float((nose[0] - mouth_center[0]) / max(1.0, face_width)),
         }
 
-    def detect_hands(self, frame: np.ndarray) -> List[Dict]:
+    def detect_hands(self, frame: np.ndarray, rgb_frame: Optional[np.ndarray] = None) -> List[Dict]:
         """Detect hand bounding boxes. Used as a high-risk occluder near baby face."""
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if rgb_frame is None:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb_frame)
         hands = []
         if not results.multi_hand_landmarks:
@@ -249,7 +252,7 @@ class FaceDetector:
             })
         return hands
 
-    def detect_hands_near_head(self, frame: np.ndarray, head_bbox) -> List[Dict]:
+    def detect_hands_near_head(self, frame: np.ndarray, head_bbox, rgb_frame: Optional[np.ndarray] = None) -> List[Dict]:
         """Detect hands only around the head/face ROI to reduce CPU and false positives."""
         if head_bbox is None:
             return []
@@ -257,6 +260,7 @@ class FaceDetector:
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0 or roi.shape[0] < 40 or roi.shape[1] < 40:
             return []
+        # 如果是ROI检测，还是需要单独转换ROI的RGB
         hands = self.detect_hands(roi)
         mapped = []
         for hand in hands:

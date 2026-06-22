@@ -17,8 +17,8 @@ network:
 
 inference:
   model_complexity: 1  # 模型复杂度: 0=快, 1=平衡, 2=准
-  min_detection_confidence: 0.5
-  min_tracking_confidence: 0.5
+  min_detection_confidence: 0.7  # 提高到0.7，避免误检到毯子/玩具等物体
+  min_tracking_confidence: 0.6
   # Heavy algorithm detection FPS. Preview FPS is configured separately under preview.
   inference_fps: 3
   display_fps: 10  # deprecated; use preview.display_fps
