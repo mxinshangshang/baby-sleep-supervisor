@@ -248,7 +248,7 @@ class Storage:
             conn.close()
 
     def _cleanup_old_data(self):
-        """清理过期数据"""
+        """清理过期数据（统一30天）"""
         print("[Storage] 开始清理过期数据...")
 
         cutoff_date = datetime.now() - timedelta(days=self.retention_days)
@@ -259,17 +259,17 @@ class Storage:
         cursor = conn.cursor()
 
         try:
-            # 删除过期事件
+            # 1. 删除过期事件
             cursor.execute('DELETE FROM events WHERE timestamp < ?', (cutoff_timestamp,))
             deleted_events = cursor.rowcount
 
-            # 删除过期统计
+            # 2. 删除过期统计
             cursor.execute('DELETE FROM statistics WHERE date < ?', (cutoff_date_str,))
             deleted_stats = cursor.rowcount
 
             conn.commit()
 
-            # 删除过期照片目录
+            # 3. 删除过期照片目录
             deleted_photos = 0
             freed_space_mb = 0
 
@@ -290,8 +290,44 @@ class Storage:
                     # 不是日期格式的目录跳过
                     continue
 
+            # 4. 清理 crash_log.txt - 只保留最近30天的日志
+            crash_log_path = os.path.join(BASE_DIR, "data", "crash_log.txt")
+            deleted_crash_log_lines = 0
+            if os.path.exists(crash_log_path):
+                try:
+                    with open(crash_log_path, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()
+
+                    # 找到30天前的分割点
+                    kept_lines = []
+                    cutoff_str = cutoff_date.strftime("%Y-%m-%d")
+                    found_cutoff = False
+
+                    for line in lines:
+                        # 检查行是否包含日期标记
+                        if '[' in line and ']' in line:
+                            try:
+                                # 尝试从日志行中提取日期
+                                line_date_str = line.split('[')[1].split(']')[0].split()[0]
+                                if line_date_str < cutoff_str:
+                                    found_cutoff = True
+                                    continue
+                            except:
+                                pass
+                        if not found_cutoff:
+                            kept_lines.append(line)
+                        else:
+                            deleted_crash_log_lines += 1
+
+                    if deleted_crash_log_lines > 0:
+                        with open(crash_log_path, 'w', encoding='utf-8') as f:
+                            f.writelines(kept_lines)
+                except Exception as e:
+                    print(f"清理crash_log.txt失败: {e}")
+
             print(f"[Storage] 清理完成: 删除 {deleted_events} 条事件, {deleted_stats} 条统计, "
-                  f"{deleted_photos} 张照片, 释放空间 {freed_space_mb:.1f}MB")
+                  f"{deleted_photos} 张照片, {deleted_crash_log_lines} 行crash_log, "
+                  f"释放空间 {freed_space_mb:.1f}MB")
 
         except Exception as e:
             print(f"清理旧数据失败: {e}")

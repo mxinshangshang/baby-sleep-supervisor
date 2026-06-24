@@ -165,11 +165,12 @@ class RegionCalibrator:
             return False
 
     def read_frame(self):
-        size_data = self.connection.read(struct.calcsize('<L'))
-        if not size_data:
+        header_size = struct.calcsize('<LL')
+        header_data = self.connection.read(header_size)
+        if not header_data:
             raise RuntimeError("摄像头服务器断开连接")
 
-        size = struct.unpack('<L', size_data)[0]
+        size, camera_id = struct.unpack('<LL', header_data)
         frame_data = self.connection.read(size)
         if len(frame_data) != size:
             raise RuntimeError("接收帧数据不完整")

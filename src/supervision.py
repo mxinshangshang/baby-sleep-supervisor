@@ -20,8 +20,13 @@ from src.storage import Storage
 class SleepSupervisor:
     def __init__(self):
         self.config = get_config()
-        detection_cfg = self.config.get("detection", {})
+        self.detection_cfg_day = self.config.get("detection", {})
+        self.detection_cfg_night = self.config.get("detection_night", self.detection_cfg_day)
         supervision_cfg = self.config.get("supervision", {})
+
+        # 当前模式
+        self.is_night_mode = False
+        self._last_mode_switch_time = 0.0
 
         # 初始化检测器
         self.face_detector = FaceDetector(
@@ -34,7 +39,7 @@ class SleepSupervisor:
         self.region_detector = RegionDetector()
 
         # 设置安全区域（支持矩形和多边形两种格式）
-        safe_region = detection_cfg.get("safe_region", [[50, 50], [590, 430]])
+        safe_region = self.detection_cfg_day.get("safe_region", [[50, 50], [590, 430]])
         if len(safe_region) == 2 and len(safe_region[0]) == 2 and len(safe_region[1]) == 2:
             # 旧版矩形格式
             self.region_detector.set_safe_region((tuple(safe_region[0]), tuple(safe_region[1])))
@@ -46,111 +51,79 @@ class SleepSupervisor:
         self.notifier = Notifier()
         self.storage = Storage()
 
-        # 检测阈值
-        self.cry_threshold = detection_cfg.get("cry_confidence_threshold", 0.5)
-        self.cry_duration_threshold = detection_cfg.get("cry_duration_threshold", 1.5)  # 哭声持续时间阈值（秒）
-        self.exposure_threshold = detection_cfg.get("exposure_threshold", 0.3)
-        self.occlusion_threshold = detection_cfg.get("occlusion_threshold", 0.6)
-        self.pose_visibility_threshold = detection_cfg.get("pose_visibility_threshold", 0.5)
-        self.pose_min_visible_landmarks = detection_cfg.get("pose_min_visible_landmarks", 6)
-        self.pose_min_core_landmarks = detection_cfg.get("pose_min_core_landmarks", 2)
-        self.pose_min_body_bbox_area = detection_cfg.get("pose_min_body_bbox_area", 1800)
-        self.pose_min_torso_bbox_area = detection_cfg.get("pose_min_torso_bbox_area", 500)
-        self.pose_bbox_padding_px = detection_cfg.get("pose_bbox_padding_px", 12)
-        self.head_bbox_padding_px = detection_cfg.get("head_bbox_padding_px", 20)
-        self.face_min_bbox_area = detection_cfg.get("face_min_bbox_area", 900)
-        self.presence_score_threshold = detection_cfg.get("presence_score_threshold", 0.55)
-        self.presence_confirm_ratio = detection_cfg.get("presence_confirm_ratio", 0.6)
-        self.presence_uncertain_grace_s = detection_cfg.get("presence_uncertain_grace_s", 2.0)
-        self.region_body_overlap_threshold = detection_cfg.get("region_body_overlap_threshold", 0.55)
-        self.region_torso_overlap_threshold = detection_cfg.get("region_torso_overlap_threshold", 0.50)
-        self.region_exit_confirm_ratio = detection_cfg.get("region_exit_confirm_ratio", 0.7)
-        self.alert_requires_confirmed_presence = detection_cfg.get("alert_requires_confirmed_presence", True)
-        self.face_absence_enabled = detection_cfg.get("face_absence_detection_enabled", True)
-
-        # 趴睡检测
-        self.prone_enabled = detection_cfg.get("prone_detection_enabled", True)
-
-        # 人脸不可见状态（兼容旧代码 + 新帧计数逻辑）
-        self.face_absence_start_time: Optional[float] = None
-
         # =================================================================
-        # 【统一帧防抖】所有视频监控项默认3帧确认，差异化修改直接改各变量值即可
+        # 初始化基础变量（模式无关）
         # =================================================================
-        self.CONFIRM_FRAMES: int = 3  # 统一默认值，需要差异化只需修改下面某个变量
+        self.CONFIRM_FRAMES: int = 3
 
-        # 各监控项独立确认帧数（都默认等于统一常量）
-        self.occlusion_confirm_frames: int = self.CONFIRM_FRAMES    # 遮挡检测
-        self.exposure_confirm_frames: int = self.CONFIRM_FRAMES     # 肢体裸露/踢被子
-        self.prone_confirm_frames: int = 8         # 趴睡检测（需要更长时间确认，区分侧睡）
-        self.face_absence_confirm_frames: int = self.CONFIRM_FRAMES # 人脸不可见
-        self.region_confirm_frames: int = detection_cfg.get("region_confirm_frames", self.CONFIRM_FRAMES)  # 区域进入/离开
+        # 各监控项独立确认帧数（会在 _apply_config 里根据模式更新）
+        self.occlusion_confirm_frames: int = self.CONFIRM_FRAMES
+        self.exposure_confirm_frames: int = self.CONFIRM_FRAMES
+        self.prone_confirm_frames: int = 8
+        self.face_absence_confirm_frames: int = self.CONFIRM_FRAMES
+        self.region_confirm_frames: int = self.CONFIRM_FRAMES
 
-        # 各监控项独立帧计数器（纯视觉检测用帧计数）
-        self.occlusion_frames: int = 0                               # 遮挡帧计数
-        self.exposure_frames: int = 0                                # 肢体裸露帧计数
-        self.prone_frames: int = 0                                   # 趴睡帧计数
+        # 各监控项独立帧计数器
+        self.occlusion_frames: int = 0
+        self.exposure_frames: int = 0
+        self.prone_frames: int = 0
         self.face_absence_frames: int = 0
-        self.prone_face_missing_frames: int = 0                            # 人脸不可见帧计数
-        self.region_exit_frames: int = 0                             # 区域离开帧计数
-        self.region_enter_frames: int = 0                            # 区域进入帧计数
+        self.prone_face_missing_frames: int = 0
+        self.region_exit_frames: int = 0
+        self.region_enter_frames: int = 0
 
-        # 哭声检测用时间防抖（音频是独立流，用时间更科学）
+        # 哭声检测状态
         self.cry_start_time: Optional[float] = None
-
-        # Edge-triggered region alerts: only notify on ENTER / EXIT state transitions,
-        # not continuously while staying inside or outside the region.
-        self.last_in_region: Optional[bool] = None
-        # 证据预缓存：状态刚变化时立即抓拍，防抖确认后用缓存的照片发送通知
-        # 确保通知画面与事件发生瞬间完全同步
-        self.region_enter_candidate_photo: Optional[np.ndarray] = None
-        self.region_exit_candidate_photo: Optional[np.ndarray] = None
         self.last_cry_confidence: float = 0.0
         self.last_cry_time: float = 0.0
-        self.cry_hold_s: float = detection_cfg.get("cry_hold_s", 8.0)
-        self.distress_start_time: Optional[float] = None
-        self.distress_threshold = detection_cfg.get("distress_confidence_threshold", 0.70)
-        self.distress_duration_threshold = detection_cfg.get("distress_duration_threshold", 1.5)
 
-        # 平滑窗口
+        # 区域检测状态
+        self.last_in_region: Optional[bool] = None
+        self.region_enter_candidate_photo: Optional[np.ndarray] = None
+        self.region_exit_candidate_photo: Optional[np.ndarray] = None
+
+        # 人脸不可见状态
+        self.face_absence_start_time: Optional[float] = None
+
+        # 其它检测状态
+        self.distress_start_time: Optional[float] = None
+
+        # 平滑窗口（初始创建，大小会在 _apply_config 里更新）
         self.cry_confidence_window = deque(maxlen=6)
         self.exposure_ratio_window = deque(maxlen=6)
-        # Reduced window from 10 → 4 frames (≈2 seconds at 2fps) to avoid
-        # ghost alarms: a transient high score 5 seconds ago should not
-        # keep triggering alerts long after the occluder (hand/blanket) has moved away.
-        # Short window + 1-second duration threshold still filters single-frame noise.
         self.occlusion_confidence_window = deque(maxlen=4)
-        self.presence_score_window = deque(maxlen=detection_cfg.get("presence_window_size", 8))
-        self.region_exit_window = deque(maxlen=detection_cfg.get("region_exit_window_size", 8))
-        self.head_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 8))
-        self.limb_motion_window = deque(maxlen=detection_cfg.get("motion_window_size", 8))
+        self.presence_score_window = deque(maxlen=8)
+        self.region_exit_window = deque(maxlen=8)
+        self.head_motion_window = deque(maxlen=8)
+        self.limb_motion_window = deque(maxlen=8)
+        self.mouth_open_window = deque(maxlen=6)
+        self.distress_window = deque(maxlen=6)
+        self.mouth_variation_window = deque(maxlen=6)
+        self.cry_temporal_window = deque(maxlen=6)
+        self.mouth_pulse_window = deque(maxlen=6)
 
-        # 手部检测缓存：FaceMesh可用时每1秒跑一次，不可用时每帧跑
+        # 手部检测缓存
         self.hands_cache: List[Dict] = []
         self.hands_cache_time = 0.0
         self.hands_detect_interval_s = 1.0
 
-        # FaceDetection 降频：上一帧FaceMesh成功时跳过BlazeFace
+        # FaceDetection 降频
         self._last_facemesh_ok = False
-        self.mouth_open_window = deque(maxlen=detection_cfg.get("mouth_open_window_size", 6))
-        self.distress_window = deque(maxlen=detection_cfg.get("distress_window_size", 6))
         self.prev_mouth_open_score: Optional[float] = None
-        self.mouth_variation_window = deque(maxlen=detection_cfg.get("mouth_variation_window_size", 6))
-        self.cry_temporal_window = deque(maxlen=detection_cfg.get("cry_temporal_window_size", 6))
-        self.mouth_pulse_window = deque(maxlen=detection_cfg.get("mouth_pulse_window_size", 6))
         self.prev_mouth_trend: Optional[int] = None
         self.prev_motion_points: Optional[Dict] = None
         self.last_confirmed_presence_time = 0.0
 
-        # 检测开关
-        self.cry_enabled = detection_cfg.get("cry_detection_enabled", True)
-        self.exposure_enabled = detection_cfg.get("limb_exposure_enabled", True)
-        self.occlusion_enabled = detection_cfg.get("occlusion_detection_enabled", True)
-        self.region_enabled = detection_cfg.get("region_detection_enabled", True)
-
         # 告警冷却
         self.alert_cooldown = supervision_cfg.get("alert_cooldown_s", 60)
         self.last_alert_time: Dict[str, float] = {}
+
+        # 状态属性（get_status_summary需要）
+        self.fps: float = 0.0
+        self.frame_count: int = 0
+        self.last_results: Optional[Dict] = None
+        self.exposure_start_time: Optional[float] = None
+        self.prone_start_time: Optional[float] = None
 
         # 🎙️ 智能音频网关（独立进程模式，永不阻塞主循环）
         audio_cfg = self.config.get("audio", {})
@@ -187,6 +160,129 @@ class SleepSupervisor:
 
         # 最近的检测结果
         self.last_results: Dict = {}
+
+        # 应用初始配置
+        self._apply_config()
+
+    def _apply_config(self):
+        """根据当前模式应用对应的配置参数"""
+        detection_cfg = self.detection_cfg_night if self.is_night_mode else self.detection_cfg_day
+
+        # 检测阈值
+        self.cry_threshold = detection_cfg.get("cry_confidence_threshold", 0.5)
+        self.cry_duration_threshold = detection_cfg.get("cry_duration_threshold", 1.5)
+        self.exposure_threshold = detection_cfg.get("exposure_threshold", 0.3)
+        self.occlusion_threshold = detection_cfg.get("occlusion_threshold", 0.6)
+        self.pose_visibility_threshold = detection_cfg.get("pose_visibility_threshold", 0.5)
+        self.pose_min_visible_landmarks = detection_cfg.get("pose_min_visible_landmarks", 6)
+        self.pose_min_core_landmarks = detection_cfg.get("pose_min_core_landmarks", 2)
+        self.pose_min_body_bbox_area = detection_cfg.get("pose_min_body_bbox_area", 1800)
+        self.pose_min_torso_bbox_area = detection_cfg.get("pose_min_torso_bbox_area", 500)
+        self.pose_bbox_padding_px = detection_cfg.get("pose_bbox_padding_px", 12)
+        self.head_bbox_padding_px = detection_cfg.get("head_bbox_padding_px", 20)
+        self.face_min_bbox_area = detection_cfg.get("face_min_bbox_area", 900)
+        self.presence_score_threshold = detection_cfg.get("presence_score_threshold", 0.55)
+        self.presence_confirm_ratio = detection_cfg.get("presence_confirm_ratio", 0.6)
+        self.presence_uncertain_grace_s = detection_cfg.get("presence_uncertain_grace_s", 2.0)
+        self.region_body_overlap_threshold = detection_cfg.get("region_body_overlap_threshold", 0.55)
+        self.region_torso_overlap_threshold = detection_cfg.get("region_torso_overlap_threshold", 0.50)
+        self.region_exit_confirm_ratio = detection_cfg.get("region_exit_confirm_ratio", 0.7)
+        self.alert_requires_confirmed_presence = detection_cfg.get("alert_requires_confirmed_presence", True)
+        self.face_absence_enabled = detection_cfg.get("face_absence_detection_enabled", True)
+
+        # 趴睡检测
+        self.prone_enabled = detection_cfg.get("prone_detection_enabled", True)
+
+        # 各监控项独立确认帧数
+        self.region_confirm_frames: int = detection_cfg.get("region_confirm_frames", self.CONFIRM_FRAMES)
+
+        self.cry_hold_s: float = detection_cfg.get("cry_hold_s", 8.0)
+        self.distress_threshold = detection_cfg.get("distress_confidence_threshold", 0.70)
+        self.distress_duration_threshold = detection_cfg.get("distress_duration_threshold", 1.5)
+
+        # 更新窗口大小（重新创建 deque 并保留现有数据）
+        def _resize_deque(dq, new_max):
+            new_dq = deque(maxlen=new_max)
+            new_dq.extend(list(dq))
+            return new_dq
+
+        presence_win_size = detection_cfg.get("presence_window_size", 8)
+        region_exit_win_size = detection_cfg.get("region_exit_window_size", 8)
+        motion_win_size = detection_cfg.get("motion_window_size", 8)
+        mouth_open_win_size = detection_cfg.get("mouth_open_window_size", 6)
+        distress_win_size = detection_cfg.get("distress_window_size", 6)
+        mouth_variation_win_size = detection_cfg.get("mouth_variation_window_size", 6)
+        cry_temporal_win_size = detection_cfg.get("cry_temporal_window_size", 6)
+        mouth_pulse_win_size = detection_cfg.get("mouth_pulse_window_size", 6)
+
+        self.presence_score_window = _resize_deque(self.presence_score_window, presence_win_size)
+        self.region_exit_window = _resize_deque(self.region_exit_window, region_exit_win_size)
+        self.head_motion_window = _resize_deque(self.head_motion_window, motion_win_size)
+        self.limb_motion_window = _resize_deque(self.limb_motion_window, motion_win_size)
+        self.mouth_open_window = _resize_deque(self.mouth_open_window, mouth_open_win_size)
+        self.distress_window = _resize_deque(self.distress_window, distress_win_size)
+        self.mouth_variation_window = _resize_deque(self.mouth_variation_window, mouth_variation_win_size)
+        self.cry_temporal_window = _resize_deque(self.cry_temporal_window, cry_temporal_win_size)
+        self.mouth_pulse_window = _resize_deque(self.mouth_pulse_window, mouth_pulse_win_size)
+
+        # 检测开关
+        self.cry_enabled = detection_cfg.get("cry_detection_enabled", True)
+        self.exposure_enabled = detection_cfg.get("limb_exposure_enabled", True)
+        self.occlusion_enabled = detection_cfg.get("occlusion_detection_enabled", True)
+        self.region_enabled = detection_cfg.get("region_detection_enabled", True)
+
+    def _preprocess_night_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        夜视图像预处理增强 - 提升 MediaPipe 在红外夜视下的检测能力
+
+        策略（优化版）：
+        1. 先去噪 - 使用双边滤波保留边缘的同时去噪
+        2. 自适应直方图均衡化 - 适度增强局部对比度
+        3. 亮度正常化 - 让 MediaPipe 更容易学习
+        """
+        cfg = self.detection_cfg_night
+
+        # 检查是否启用预处理
+        if not cfg.get("night_preprocess_enabled", True):
+            return frame
+
+        # 转换到 YUV 颜色空间进行处理
+        if len(frame.shape) == 3 and frame.shape[2] == 3:
+            yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+            y, u, v = cv2.split(yuv)
+        else:
+            y = frame
+            u = v = None
+
+        # 1. 双边滤波去噪（保留边缘，比高斯模糊好）
+        y = cv2.bilateralFilter(y, 5, 35, 35)
+
+        # 2. CLAHE - 局部对比度增强（更合理的参数）
+        if cfg.get("night_clahe_enabled", True):
+            clip_limit = cfg.get("night_clahe_clip_limit", 1.5)  # 更保守的对比度限制
+            grid_size = cfg.get("night_clahe_grid_size", 8)
+            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(grid_size, grid_size))
+            y = clahe.apply(y)
+
+        # 3. 亮度和对比度调整（更温和）
+        alpha = cfg.get("night_contrast_boost", 1.1)  # 降低对比度提升
+        beta = cfg.get("night_brightness_offset", 10)  # 稍微提升亮度
+        y = cv2.convertScaleAbs(y, alpha=alpha, beta=beta)
+
+        # 4. 轻微锐化（更温和，避免增强噪点）
+        kernel = np.array([[0, -0.05, 0],
+                           [-0.05, 1.2, -0.05],
+                           [0, -0.05, 0]], dtype=np.float32)
+        y = cv2.filter2D(y, -1, kernel)
+
+        # 合并回 BGR
+        if u is not None and v is not None:
+            yuv = cv2.merge([y, u, v])
+            processed = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+        else:
+            processed = cv2.cvtColor(y, cv2.COLOR_GRAY2BGR)
+
+        return processed
 
     def _get_smoothed_value(self, window: deque, new_value: float) -> float:
         """获取平滑后的值"""
@@ -285,30 +381,40 @@ class SleepSupervisor:
             # 合理的躯干结构检查
             # ============================================================
             # 1. 躯干不能太短
-            if torso_length < 20:  # 像素阈值，适应不同分辨率
+            if torso_length < 50:  # 大幅提高，过滤小物体误检
                 return False
 
-            # 2. 肩宽和髋宽应该在合理比例范围内 (0.5 ~ 2.0)
-            # 婴儿各种睡姿下这个比例都不会太极端
+            # 2. 肩宽和髋宽应该在合理比例范围内 (0.6 ~ 1.8)
             if hip_width > 0:
                 shoulder_hip_ratio = shoulder_width / hip_width
-                if shoulder_hip_ratio < 0.3 or shoulder_hip_ratio > 3.0:
+                if shoulder_hip_ratio < 0.6 or shoulder_hip_ratio > 1.8:
                     return False
 
             # 3. 肩宽和髋宽都应该显著小于躯干长度
-            # 躺在床上时，躯干（肩到髋）应该比肩宽/髋宽要长
             if shoulder_width > 0 and hip_width > 0:
                 max_width = max(shoulder_width, hip_width)
-                if max_width > torso_length * 2.5:  # 放宽到2.5倍，适应侧身
+                if max_width > torso_length * 1.8:  # 更严格
+                    return False
+                if max_width < 20:  # 绝对尺寸太小
                     return False
 
-            # 4. 四个点应该形成一个大致的梯形/四边形，而不是杂乱分布
-            # 检查左右两边是否大致对称
+            # 4. 四个点应该形成一个大致的梯形/四边形
             left_side_len = np.linalg.norm(ls - lh)
             right_side_len = np.linalg.norm(rs - rh)
             if left_side_len > 0 and right_side_len > 0:
                 side_ratio = min(left_side_len, right_side_len) / max(left_side_len, right_side_len)
-                if side_ratio < 0.25:  # 左右边长度差异太大，可能是误检
+                if side_ratio < 0.5:  # 更严格的对称要求
+                    return False
+
+            # 5. 新增：检查所有关键点不能太集中在一个小区域
+            all_points = np.array([(lm[0], lm[1]) for lm in landmarks if lm[2] >= 0.5])
+            if len(all_points) >= 5:
+                min_x = np.min(all_points[:, 0])
+                max_x = np.max(all_points[:, 0])
+                min_y = np.min(all_points[:, 1])
+                max_y = np.max(all_points[:, 1])
+                spread_area = (max_x - min_x) * (max_y - min_y)
+                if spread_area < 10000:  # 关键点分布区域太小，可能是小物体误检
                     return False
 
         # ============================================================
@@ -388,6 +494,17 @@ class SleepSupervisor:
         score = 0.0
         if len(visible) >= self.pose_min_visible_landmarks and body_area >= self.pose_min_body_bbox_area:
             score += 0.30
+        else:
+            # 不满足基础条件，直接给低分，并清空bboxes以防止下游误使用
+            summary["body_bbox"] = None
+            summary["torso_bbox"] = None
+            summary["head_bbox"] = None
+            summary["body_center"] = None
+            summary["torso_center"] = None
+            summary["head_center"] = None
+            summary["core_landmarks"] = 0
+            return summary
+
         if core_landmarks >= self.pose_min_core_landmarks:
             score += 0.25
         if torso_area >= self.pose_min_torso_bbox_area or head_bbox:
@@ -397,8 +514,8 @@ class SleepSupervisor:
         if geometry_valid:
             score += 0.15  # 几何合理是强信号
 
-        # 姿态可用条件：score >= 0.35 且 几何合理
-        is_available = score >= 0.35 and geometry_valid
+        # 姿态可用条件：score >= 0.5 且 几何合理（更严格）
+        is_available = score >= 0.5 and geometry_valid
 
         summary.update({
             "available": is_available,
@@ -468,12 +585,12 @@ class SleepSupervisor:
         # ============================================================
         # 【姿态与人脸独立确认机制】
         # 核心思想：正睡靠Pose，侧睡靠Face，两者只要一个够强就算有人
-        # - Pose 质量 >= 0.65 且 几何有效 → 姿态确认（更严格，过滤其他物体误检）
-        # - Face 质量 >= 0.5 → 人脸确认（侧睡场景）
+        # - Pose 质量 >= 0.75 且 几何有效 → 姿态确认（更严格）
+        # - Face 质量 >= 0.6 → 人脸确认（更严格）
         # 避免：侧睡时Pose弱被误判为无人，同时过滤无Face的纯Pose误检
         # ============================================================
-        pose_confirmed = pose_quality >= 0.65 and pose_summary.get("geometry_valid", False)
-        face_confirmed = face_quality >= 0.50  # 侧睡/盖被子时人脸仍可确认
+        pose_confirmed = pose_quality >= 0.75 and pose_summary.get("geometry_valid", False)
+        face_confirmed = face_quality >= 0.60
         has_valid_confirmation = pose_confirmed or face_confirmed
 
         if has_valid_confirmation:
@@ -887,10 +1004,25 @@ class SleepSupervisor:
             "face_landmarks_available": face_landmarks,
         }
 
-    def process_frame(self, frame: np.ndarray) -> Tuple[Dict, np.ndarray]:
+    def process_frame(self, frame: np.ndarray, is_night_mode: bool = False) -> Tuple[Dict, np.ndarray]:
         """处理一帧图像，返回检测结果和绘制后的帧"""
         self.frame_count += 1
         now = time.time()
+
+        # 模式切换
+        if is_night_mode != self.is_night_mode:
+            self.is_night_mode = is_night_mode
+            self._last_mode_switch_time = now
+            self._apply_config()
+
+        # 保存原始帧用于显示和拍照
+        original_frame = frame
+
+        # 夜视图像预处理增强（仅用于检测，不用于显示）
+        if self.is_night_mode:
+            detect_frame = self._preprocess_night_frame(frame)
+        else:
+            detect_frame = frame
 
         if self.frame_count % 10 == 0:
             self.fps = 10 / (now - self.last_frame_time)
@@ -904,33 +1036,33 @@ class SleepSupervisor:
         }
         in_region = True  # 默认值，区域检测启用时会被覆盖
 
-        # 统一做一次 BGR→RGB 转换，避免重复计算
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # 统一做一次 BGR→RGB 转换，避免重复计算（用检测帧）
+        rgb_frame = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2RGB)
 
         if self.cry_enabled or self.occlusion_enabled:
             if self._last_facemesh_ok and now - self.face_detector.last_face_detect_time < self.face_detector.face_detect_interval_s:
                 faces = self.face_detector.last_face_detect_result
             else:
-                faces = self.face_detector.detect_faces(frame, rgb_frame)
+                faces = self.face_detector.detect_faces(detect_frame, rgb_frame)
                 self.face_detector.last_face_detect_result = faces
                 self.face_detector.last_face_detect_time = now
         else:
             faces = []
         hands = []
-        pose_data = self.body_detector.detect_pose(frame, rgb_frame) if (self.exposure_enabled or self.region_enabled) else None
-        pose_summary = self._summarize_pose(pose_data, frame.shape)
+        pose_data = self.body_detector.detect_pose(detect_frame, rgb_frame) if (self.exposure_enabled or self.region_enabled) else None
+        pose_summary = self._summarize_pose(pose_data, original_frame.shape)
         if self.occlusion_enabled and pose_summary.get("head_bbox"):
             should_detect_hands = (
                 not self._last_facemesh_ok  # FaceMesh不可用时每帧跑
                 or now - self.hands_cache_time >= self.hands_detect_interval_s
             )
             if should_detect_hands:
-                hands = self.face_detector.detect_hands_near_head(frame, pose_summary.get("head_bbox"), rgb_frame)
+                hands = self.face_detector.detect_hands_near_head(detect_frame, pose_summary.get("head_bbox"), rgb_frame)
                 self.hands_cache = hands
                 self.hands_cache_time = now
             else:
                 hands = self.hands_cache
-        landmarks = self.face_detector.detect_face_landmarks(frame, pose_summary.get("head_bbox"), rgb_frame) if (self.cry_enabled or self.occlusion_enabled) else None
+        landmarks = self.face_detector.detect_face_landmarks(detect_frame, pose_summary.get("head_bbox"), rgb_frame) if (self.cry_enabled or self.occlusion_enabled) else None
         self._last_facemesh_ok = landmarks is not None
         face_pose = self.face_detector.classify_face_orientation(landmarks)
         face_summary = self._summarize_face(faces, landmarks)
@@ -1027,7 +1159,7 @@ class SleepSupervisor:
                     "frames": self.face_absence_frames,
                 }
                 if self.face_absence_frames >= self.face_absence_confirm_frames and self._should_alert("face_not_visible"):
-                    photo_path = self.storage.save_photo(frame, now)
+                    photo_path = self.storage.save_photo(original_frame, now)
                     details = {
                         "frames": self.face_absence_frames,
                         "presence_score": float(presence.get("smoothed_score", 0.0)),
@@ -1101,8 +1233,18 @@ class SleepSupervisor:
             hands_near_head = len(baby_topology.get("nearby_hands", [])) > 0
 
             likely_side_sleeping = side_face_detected or known_side_lying or axis_is_horizontal or hands_near_head
+            # 趴睡检测需要更严格的条件：确保是真的检测到了人
+            pose_quality = pose_summary.get("quality", 0)
+            topology_reliable = baby_topology.get("topology_reliable", False)
+            geometry_valid = pose_summary.get("geometry_valid", False)
+            has_reliable_detection = (
+                (pose_quality >= 0.5 and geometry_valid) or
+                topology_reliable or
+                face_summary.get("landmarks_available", False) or
+                (face_summary.get("mode", "") == "bbox_only_possible_side_face")
+            )
 
-            if head_bbox_exists and not face_landmarks_ok and not likely_side_sleeping:
+            if head_bbox_exists and not face_landmarks_ok and not likely_side_sleeping and has_reliable_detection:
                 self.face_mesh_absence_start_time = now
                 self.prone_face_missing_frames += 1
             else:
@@ -1112,7 +1254,7 @@ class SleepSupervisor:
             prone_suspected = False
             prone_reason = ""
 
-            if head_bbox_exists and not face_landmarks_ok and self.prone_face_missing_frames >= self.face_absence_confirm_frames:
+            if head_bbox_exists and not face_landmarks_ok and self.prone_face_missing_frames >= self.face_absence_confirm_frames and has_reliable_detection:
                 if likely_side_sleeping:
                     prone_reason = f"mesh_missing_but_likely_side_sleeping"
                 else:
@@ -1132,7 +1274,7 @@ class SleepSupervisor:
                     "hands_near_head": hands_near_head,
                 }
                 if self.prone_frames >= self.prone_confirm_frames and self._should_alert("prone_detected"):
-                    photo_path = self.storage.save_photo(frame, now)
+                    photo_path = self.storage.save_photo(original_frame, now)
                     event_id = self.storage.save_event(
                         event_type="prone_detected",
                         level="danger",
@@ -1206,7 +1348,7 @@ class SleepSupervisor:
                     if self.cry_start_time is None:
                         self.cry_start_time = now
                     elif now - self.cry_start_time >= self.cry_duration_threshold and self._should_alert("cry_detected"):
-                        photo_path = self.storage.save_photo(frame, now)
+                        photo_path = self.storage.save_photo(original_frame, now)
                         level = "warning" if smoothed_cry < 0.85 else "danger"
                         audio_ctx = self._build_alert_context(audio_features)
                         event_id = self.storage.save_event(
@@ -1240,7 +1382,7 @@ class SleepSupervisor:
                         })
                 else:
                     self.cry_start_time = None
-            elif in_region and self.audio_enabled and audio_features and audio_features.cry_confidence >= 0.15:
+            elif in_region and self.audio_enabled and audio_features and presence["confirmed"] and audio_features.cry_confidence >= 0.4 and audio_features.is_crying:
                 # 场景2：in_region 但 landmarks 不可用 / presence 未确认（盖被子/侧脸场景）
                 # 降级评估：音频 + 动作，不用人脸表情
                 motion_confidence = float(motion_features.get("agitation", 0.0))
@@ -1272,7 +1414,7 @@ class SleepSupervisor:
                     if self.cry_start_time is None:
                         self.cry_start_time = now
                     elif now - self.cry_start_time >= 1.5 and self._should_alert("cry_detected"):
-                        photo_path = self.storage.save_photo(frame, now) if frame is not None else None
+                        photo_path = self.storage.save_photo(original_frame, now) if frame is not None else None
                         audio_ctx = self._build_alert_context(audio_features)
                         event_id = self.storage.save_event(
                             event_type="cry_detected",
@@ -1305,7 +1447,7 @@ class SleepSupervisor:
             else:
                 # 场景3：不在区，完全交给后面的纯音频快速通道处理
                 self.cry_start_time = None
-                fallback_mouth_score, fallback_mouth_features = self.face_detector.detect_mouth_open_fallback(frame, baby_topology.get("head_bbox") or pose_summary.get("head_bbox")) if presence["confirmed"] else (0.0, {})
+                fallback_mouth_score, fallback_mouth_features = self.face_detector.detect_mouth_open_fallback(detect_frame, baby_topology.get("head_bbox") or pose_summary.get("head_bbox")) if presence["confirmed"] else (0.0, {})
                 if presence["confirmed"] and fallback_mouth_score > 0:
                     self.mouth_open_window.append(fallback_mouth_score)
                     if self.prev_mouth_open_score is not None:
@@ -1351,10 +1493,10 @@ class SleepSupervisor:
             if presence["confirmed"] and in_region:
                 if landmarks is not None:
                     # 通用遮挡检测：检测任何物体（手/被子/玩具/枕头/衣物等）
-                    occlusion_confidence, occlusion_features = self.face_detector.detect_occlusion(frame, landmarks, hands)
+                    occlusion_confidence, occlusion_features = self.face_detector.detect_occlusion(detect_frame, landmarks, hands)
                 else:
                     # landmarks 不可用（侧脸/遮挡严重）→ 降级用头部 ROI 检测
-                    occlusion_confidence, occlusion_features = self.face_detector.detect_head_occlusion_fallback(frame, pose_summary.get("head_bbox"), hands)
+                    occlusion_confidence, occlusion_features = self.face_detector.detect_head_occlusion_fallback(detect_frame, pose_summary.get("head_bbox"), hands)
 
                 smoothed_occlusion = self._get_smoothed_value(self.occlusion_confidence_window, occlusion_confidence)
                 occlusion_status = "available" if landmarks is not None else "fallback"
@@ -1373,7 +1515,7 @@ class SleepSupervisor:
                 
                 # 3帧确认后触发告警
                 if self.occlusion_frames >= self.occlusion_confirm_frames and self._should_alert("occlusion_detected"):
-                    photo_path = self.storage.save_photo(frame, now)
+                    photo_path = self.storage.save_photo(original_frame, now)
                     event_id = self.storage.save_event(
                         event_type="occlusion_detected",
                         level="danger",
@@ -1447,12 +1589,12 @@ class SleepSupervisor:
 
                 if pose_quality_ok:
                     # 模式1：完整模式 - 全功能肢体检测
-                    exposure_ratio, exposure_features = self.body_detector.detect_limb_exposure(frame, pose_data)
+                    exposure_ratio, exposure_features = self.body_detector.detect_limb_exposure(detect_frame, pose_data)
                     coverage_status = "available"
                 elif has_partial_detection or has_limb_motion:
                     # 模式2：降级模式 - 盖被子/侧脸场景，用简单检测
                     # 即使看不到完整姿态，只要有肤色裸露或肢体运动，就可能是踢被子
-                    exposure_ratio, exposure_features = self.body_detector.detect_limb_exposure_simple(frame, baby_topology)
+                    exposure_ratio, exposure_features = self.body_detector.detect_limb_exposure_simple(detect_frame, baby_topology)
                     if has_limb_motion:
                         exposure_features["limb_motion_detected"] = True
                         exposure_features["limb_motion_score"] = motion_features.get("limb_motion", 0)
@@ -1507,7 +1649,7 @@ class SleepSupervisor:
                         self.exposure_frames = max(0, self.exposure_frames - 1)
                     
                     if self.exposure_frames >= self.exposure_confirm_frames and self._should_alert("limb_exposure"):
-                        photo_path = self.storage.save_photo(frame, now)
+                        photo_path = self.storage.save_photo(original_frame, now)
                         event_id = self.storage.save_event(
                             event_type="limb_exposure",
                             level="warning",
@@ -1589,6 +1731,7 @@ class SleepSupervisor:
 
             if not has_any_detection:
                 # 没有任何有效检测信号 → 保持上一帧状态，防止抖动
+                # 夜视模式下更应该如此！
                 in_region = self.last_in_region if self.last_in_region is not None else False
                 decision_basis = "no_detection_signal_keep_previous_state"
             else:
@@ -1596,7 +1739,6 @@ class SleepSupervisor:
                 # ⭐ 优先级最高：人脸中心在区域内 → 金标准
                 if face_center_in_region:
                     in_region = True
-                    presence["confirmed"] = True  # 有脸就有人
                     decision_basis = "face_center_in_region_gold_standard"
                 # 优先级2：头框中心在区域内 + 至少有少量重叠
                 elif head_center_in_region and (body_overlap >= 0.20 or torso_overlap >= 0.20):
@@ -1650,15 +1792,39 @@ class SleepSupervisor:
 
             # 离开窗口：两种情况都算离开信号
             # 1. 确认有人但不在区域
-            # 2. 完全没有检测信号（宝宝真的走了）
+            # 2. 完全没有检测信号，但只有之前确认过有人时才算（宝宝真的走了）
             no_detection = not has_any_detection
-            self.region_exit_window.append((not in_region and presence["confirmed"]) or no_detection)
-            exit_ratio = sum(1 for v in self.region_exit_window if v) / len(self.region_exit_window)
-            confirmed_exit = (
-                (presence["confirmed"] and not in_region and exit_ratio >= self.region_exit_confirm_ratio)
-                or
-                (no_detection and exit_ratio >= 0.8)  # 完全没信号时，更快确认离开
-            )
+            # 只有之前确认过有人，且现在完全没信号，才算离开信号
+            no_detection_exit = no_detection and (self.last_in_region is True or self.last_confirmed_presence_time > 0)
+
+            # 夜视模式特殊处理：更保守
+            if self.is_night_mode:
+                # 夜视模式下：
+                # 1. 确认有人且不在区域 → 算离开信号
+                # 2. 无检测信号但最近3秒内确实检测到宝宝 → 也算离开信号（防止抱走时漏报）
+                time_since_last_presence = now - self.last_confirmed_presence_time
+                no_detection_but_recently_present = no_detection and time_since_last_presence < 3
+
+                self.region_exit_window.append(
+                    (not in_region and presence["confirmed"]) or
+                    no_detection_but_recently_present
+                )
+                exit_ratio = sum(1 for v in self.region_exit_window if v) / len(self.region_exit_window)
+
+                # 夜视模式下要求合理的确认比例
+                confirmed_exit = (
+                    (presence["confirmed"] and not in_region and exit_ratio >= 0.85) or
+                    (no_detection_but_recently_present and exit_ratio >= 0.9)
+                )
+            else:
+                # 日间模式：保持原有逻辑
+                self.region_exit_window.append((not in_region and presence["confirmed"]) or no_detection_exit)
+                exit_ratio = sum(1 for v in self.region_exit_window if v) / len(self.region_exit_window)
+                confirmed_exit = (
+                    (presence["confirmed"] and not in_region and exit_ratio >= self.region_exit_confirm_ratio)
+                    or
+                    (no_detection_exit and exit_ratio >= 0.8)  # 完全没信号且之前有人时，更快确认离开
+                )
             confirmed_in = (
                 presence["confirmed"]
                 and in_region
@@ -1687,7 +1853,7 @@ class SleepSupervisor:
                 if self.region_exit_frames == 0:
                     # 第0帧：刚检测到离开迹象 → 立即抓拍作为证据
                     self.region_exit_frames = 1
-                    self.region_exit_candidate_photo = frame.copy()
+                    self.region_exit_candidate_photo = original_frame.copy()
                 else:
                     self.region_exit_frames += 1  # 帧计数+1
                 if self.region_exit_frames < self.region_confirm_frames:
@@ -1697,6 +1863,12 @@ class SleepSupervisor:
                 elif self.region_exit_frames >= self.region_confirm_frames:
                         # 确认后：用缓存的照片（状态刚变化时的那一帧）发送通知
                         should_notify_exit = self.last_in_region is not False
+                        # 夜视模式下额外检查：必须一段时间没看到人才触发
+                        if self.is_night_mode:
+                            time_since_last_presence = now - self.last_confirmed_presence_time
+                            # 夜视模式下，至少5秒没看到人才触发离开警报（6帧约2秒，稍微放宽一点）
+                            if time_since_last_presence < 5:
+                                should_notify_exit = False
                         if should_notify_exit and self.region_exit_candidate_photo is not None:
                             photo_path = self.storage.save_photo(self.region_exit_candidate_photo, now)
                             event_id = self.storage.save_event(
@@ -1733,7 +1905,7 @@ class SleepSupervisor:
                 if self.region_enter_frames == 0:
                     # 第0帧：刚检测到进入迹象 → 立即抓拍作为证据
                     self.region_enter_frames = 1
-                    self.region_enter_candidate_photo = frame.copy()
+                    self.region_enter_candidate_photo = original_frame.copy()
                 else:
                     self.region_enter_frames += 1  # 帧计数+1
                 if self.region_enter_frames < self.region_confirm_frames:
@@ -1854,7 +2026,7 @@ class SleepSupervisor:
             self.audio_gateway.stop()
             self.audio_gateway.start()
 
-        return results, frame
+        return results, original_frame
 
     @staticmethod
     def _read_cpu_temp() -> Optional[float]:
@@ -1980,5 +2152,11 @@ class SleepSupervisor:
 
     def close(self):
         """释放资源"""
+        self.stop()  # 先停止音频网关等
         self.face_detector.close()
         self.body_detector.close()
+
+    def stop(self):
+        """停止监控，清理资源"""
+        if self.audio_gateway:
+            self.audio_gateway.stop()

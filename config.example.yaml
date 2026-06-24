@@ -68,8 +68,9 @@ detection:
   face_min_bbox_area: 900
   region_body_overlap_threshold: 0.55
   region_torso_overlap_threshold: 0.50
-  region_exit_window_size: 8
-  region_exit_confirm_ratio: 0.7
+  region_exit_window_size: 14
+  region_exit_confirm_ratio: 0.75
+  region_confirm_frames: 10
   alert_requires_confirmed_presence: true
   face_absence_detection_enabled: true
   face_absence_duration_threshold: 10.0  # SIDS高风险期，缩短响应

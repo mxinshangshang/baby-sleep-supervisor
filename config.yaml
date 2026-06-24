@@ -24,7 +24,7 @@ detection:
   exposure_threshold: 0.35
   face_absence_detection_enabled: true
   face_absence_duration_threshold: 10.0
-  face_min_bbox_area: 900
+  face_min_bbox_area: 2500
   head_bbox_padding_px: 20
   limb_exposure_enabled: true
   moro_reflex_filter_enabled: true
@@ -32,10 +32,10 @@ detection:
   occlusion_duration_threshold: 2.0
   occlusion_threshold: 0.75
   pose_bbox_padding_px: 12
-  pose_min_body_bbox_area: 1800
-  pose_min_core_landmarks: 2
-  pose_min_torso_bbox_area: 500
-  pose_min_visible_landmarks: 8
+  pose_min_body_bbox_area: 8000
+  pose_min_core_landmarks: 3
+  pose_min_torso_bbox_area: 2000
+  pose_min_visible_landmarks: 10
   pose_visibility_threshold: 0.5
   presence_confirm_ratio: 0.75
   presence_score_threshold: 0.7
@@ -47,6 +47,32 @@ detection:
   region_confirm_frames: 5
   region_detection_enabled: true
   region_exit_confirm_ratio: 0.5
+  region_exit_window_size: 6
+  region_torso_overlap_threshold: 0.5
+  safe_region:
+  - - 428
+    - 229
+  - - 939
+    - 40
+  - - 950
+    - 534
+  - - 425
+    - 449
+detection_night:
+  night_brightness_offset: 10
+  night_clahe_clip_limit: 3.0
+  night_clahe_enabled: true
+  night_clahe_grid_size: 8
+  night_contrast_boost: 1.4
+  night_histogram_equalization: true
+  night_preprocess_enabled: true
+  presence_confirm_ratio: 0.8
+  presence_score_threshold: 0.75
+  presence_window_size: 12
+  region_body_overlap_threshold: 0.4
+  region_confirm_frames: 6
+  region_detection_enabled: true
+  region_exit_confirm_ratio: 0.8
   region_exit_window_size: 6
   region_torso_overlap_threshold: 0.5
   safe_region:

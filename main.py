@@ -155,10 +155,9 @@ def main():
 
     def start_camera():
         print("[Main] 启动摄像头服务器 (系统 Python)...")
-        log_fd = open("/tmp/camera_server.log", "a")
         camera_state.proc = subprocess.Popen(
             [SYSTEM_PYTHON, CAMERA_SCRIPT],
-            stdout=log_fd, stderr=subprocess.STDOUT,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env={**os.environ, "PYTHONUNBUFFERED": "1"}
         )
         camera_state.started_at = time.time()

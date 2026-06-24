@@ -22,7 +22,7 @@
                           └─────────┬───────────┘   └───────────┬──────────┘
                                     │                           │
                                     │  TCP:65433               │
-                                    │  RGB888 零拷贝          │
+                                    │  <LL头: len+cam_id + RGB888│
                                     └───────────────────────────┘
 ```
 
@@ -37,8 +37,11 @@
 - 独占摄像头硬件，使用 `picamera2` 原生接口采集
 - 支持双摄像头自动切换（常规 imx708_wide ↔ 夜视 imx708_wide_noir）
 - 固定帧率推送，避免推理波动影响采集稳定性
-- TCP Socket 服务端，帧头：4字节 little-endian 长度 + 原始 BGR 像素数据
-- 日志重定向到 `/tmp/camera_server.log`，`PYTHONUNBUFFERED=1` 确保实时输出
+- TCP Socket 服务端，帧头：`<LL` 格式（8字节）：
+  - 前4字节：帧长度（little-endian uint32）
+  - 后4字节：当前摄像头ID（0=常规/1=夜视）
+  - 后续：原始 BGR 像素数据
+- 日志重定向到 `subprocess.DEVNULL`，减少磁盘IO
 
 **双摄路由 (CameraRouter)**:
 - 对外暴露与 Picamera2 同名的鸭子接口 (`capture_array()`, `camera_configuration()`)
@@ -414,6 +417,64 @@ bright_counter ≥ stable_frames(7) → 切回常规 (cam0)
 
 ---
 
+## 昼夜双模式配置
+
+系统支持独立的昼夜两套阈值，根据摄像头ID自动切换：
+
+```yaml
+detection:           # 白天（cam0）检测参数
+  pose_min_body_bbox_area: 5000
+  region_body_overlap_threshold: 0.55
+  region_exit_window_size: 14
+  region_exit_confirm_ratio: 0.75
+
+detection_night:     # 夜视（cam1）检测参数
+  pose_min_body_bbox_area: 8000        # 夜间更严格，防毯子误检
+  region_body_overlap_threshold: 0.60
+  region_exit_window_size: 16
+  region_exit_confirm_ratio: 0.80
+```
+
+**自动切换逻辑**：inference_client 根据接收帧的 camera_id 自动选择 detection 或 detection_night。
+
+---
+
+## 误报抑制关键修复
+
+### 1. 毯子误检人体姿态
+
+**问题**：MediaPipe Pose 偶尔在毯子褶皱上检测出假阳性关键点。
+
+**修复方案**：
+- `_summarize_pose()`: 几何验证不通过时，清空 body_bbox/torso_bbox/head_bbox，防止下游误用
+- `has_reliable_detection: 只有满足 (pose_quality≥0.5 + geometry_valid) || topology_reliable || face_available 才认为检测可靠
+- 夜间模式提高 pose_min_body_bbox_area 到 8000
+
+### 2. 进程退出资源释放
+
+**问题**：q/ctrl+c 退出时音频网关、线程等资源未正确释放，导致残留进程。
+
+**修复方案**：
+```python
+# SleepSupervisor.close() 先调用 stop()
+def close(self):
+    self.stop()  # 停止音频网关等
+    self.face_detector.close()
+    self.body_detector.close()
+
+# 推理线程 stop() 增加 join(timeout)
+def stop(self):
+    self.running = False
+    if self.thread.is_alive():
+        self.thread.join(timeout=2.0)
+```
+
+### 3. storage.py 自动清理
+
+新增 crash_log.txt 清理逻辑，保留 30 天日志。
+
+---
+
 ## 配置参数总览
 
 | 模块 | 关键参数 | 默认值 |
@@ -443,20 +504,20 @@ bright_counter ≥ stable_frames(7) → 切回常规 (cam0)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| src/supervision.py | 1852 | 监督核心，所有检测逻辑 |
+| src/supervision.py | 1900+ | 监督核心，所有检测逻辑 |
 | src/audio_gateway.py | 596 | 音频网关 + 哭声检测 |
 | src/vision/face_detector.py | 636 | 人脸+表情+手部+遮挡 |
 | src/preview_renderer.py | 497 | UI渲染 + 颜色编码 |
-| inference_client.py | 487 | 三流解耦推理客户端 |
+| inference_client.py | 500+ | 三流解耦推理客户端 |
 | src/audio_detector.py | 449 | 音频信号处理 |
-| src/storage.py | 409 | SQLite存储 + 诊断快照 |
+| src/storage.py | 446 | SQLite存储 + 诊断快照 |
 | src/notifier.py | 393 | 飞书通知 |
 | main.py | 259 | 双进程管理 + 自动重启 |
 | src/vision/body_detector.py | 259 | 姿态检测 |
-| camera_server.py | 174 | 摄像头采集 + 双摄路由 |
+| camera_server.py | 180 | 摄像头采集 + 双摄路由 |
 | src/camera/dual_camera_proxy.py | 162 | 双摄互斥路由 |
 | src/vision/region_detector.py | 158 | 区域判断 |
 | src/camera/ambient_light_detector.py | 89 | 环境光线检测 |
 | src/config.py | 54 | 配置管理 |
 | src/camera/__init__.py | 3 | 包导出 |
-| **总计** | **6477** | |
+| **总计** | **6876** | |

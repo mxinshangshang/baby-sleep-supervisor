@@ -60,15 +60,18 @@ def read_cpu_temp_c():
 class LatestFrameReceiver:
     """Continuously drains the camera TCP stream and keeps only the latest decoded frame."""
 
-    def __init__(self, connection, frame_width: int, frame_height: int, frame_format: str = "YUV420"):
+    def __init__(self, connection, frame_width: int, frame_height: int, frame_format: str = "YUV420", night_camera_id: int = 1):
         self.connection = connection
         self.frame_width = frame_width
         self.frame_height = frame_height
         self.frame_format = str(frame_format or "YUV420").upper()
+        self.night_camera_id = night_camera_id
         self.lock = threading.Lock()
         self.latest_frame = None
         self.latest_seq = 0
         self.latest_time = 0.0
+        self.latest_camera_id = 0
+        self.is_night_mode = False
         self.running = True
         self.error: Optional[BaseException] = None
         self.thread = threading.Thread(target=self._run, name="camera-frame-receiver", daemon=True)
@@ -78,21 +81,23 @@ class LatestFrameReceiver:
 
     def stop(self):
         self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
 
     def snapshot(self):
         with self.lock:
             if self.latest_frame is None:
-                return None, self.latest_seq, self.latest_time
-            return self.latest_frame.copy(), self.latest_seq, self.latest_time
+                return None, self.latest_seq, self.latest_time, self.is_night_mode
+            return self.latest_frame.copy(), self.latest_seq, self.latest_time, self.is_night_mode
 
     def _run(self):
-        header_size = struct.calcsize('<L')
+        header_size = struct.calcsize('<LL')  # [长度4字节][摄像头ID4字节]
         try:
             while self.running:
-                size_data = self.connection.read(header_size)
-                if not size_data:
+                header_data = self.connection.read(header_size)
+                if not header_data:
                     raise ConnectionError("服务器断开连接")
-                size = struct.unpack('<L', size_data)[0]
+                size, camera_id = struct.unpack('<LL', header_data)
                 frame_data = self.connection.read(size)
                 if len(frame_data) != size:
                     raise ConnectionError("接收帧数据不完整")
@@ -119,6 +124,8 @@ class LatestFrameReceiver:
                     self.latest_frame = frame_bgr
                     self.latest_seq += 1
                     self.latest_time = time.time()
+                    self.latest_camera_id = camera_id
+                    self.is_night_mode = (camera_id == self.night_camera_id)
         except BaseException as e:
             self.error = e
             self.running = False
@@ -163,6 +170,8 @@ class LatestInferenceWorker:
 
     def stop(self):
         self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
 
     def set_external_max_fps(self, fps: float):
         self.external_max_fps = max(1.0, float(fps))
@@ -203,12 +212,12 @@ class LatestInferenceWorker:
                     time.sleep(min(0.02, next_inference_time - now))
                     continue
 
-                frame, seq, _ = self.receiver.snapshot()
+                frame, seq, _, is_night_mode = self.receiver.snapshot()
                 if frame is None or seq == self.last_inferred_seq:
                     time.sleep(0.005)
                     continue
 
-                results, _ = self.supervisor.process_frame(frame)
+                results, _ = self.supervisor.process_frame(frame, is_night_mode=is_night_mode)
                 self.last_inferred_seq = seq
                 self.count += 1
                 with self.lock:
@@ -246,6 +255,9 @@ def main():
     frame_width = camera_cfg.get("width", 1536)
     frame_height = camera_cfg.get("height", 864)
     frame_format = camera_cfg.get("format", "YUV420")
+
+    dual_cfg = config.get("dual_camera", {})
+    night_camera_id = int(dual_cfg.get("night_camera_id", 1))
 
     inference_cfg = config.get("inference", {})
     preview_cfg = config.get("preview", {})
@@ -335,7 +347,7 @@ def main():
                         client_socket.connect((host, port))
                         client_socket.settimeout(None)
                         connection = client_socket.makefile('rb')
-                        receiver = LatestFrameReceiver(connection, frame_width, frame_height, frame_format)
+                        receiver = LatestFrameReceiver(connection, frame_width, frame_height, frame_format, night_camera_id)
                         receiver.start()
                         inference_worker = LatestInferenceWorker(
                             supervisor, receiver, normal_inference_fps, throttle_inference_fps,
@@ -376,7 +388,7 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            frame, seq, frame_time = receiver.snapshot()
+            frame, seq, frame_time, _ = receiver.snapshot()
             if frame is None:
                 time.sleep(0.01)
                 continue

@@ -153,8 +153,13 @@ def main():
         while running:
             try:
                 frame = cam.capture_array()
+                # 获取当前摄像头 ID（如果是双摄模式）
+                active_camera_id = 0
+                if hasattr(cam, "get_status"):
+                    active_camera_id = cam.get_status().get("active_camera_id", 0)
+                # 发送格式：[4字节帧长度][4字节摄像头ID][帧数据]
                 frame_bytes = frame.tobytes()
-                header = struct.pack("<L", len(frame_bytes))
+                header = struct.pack("<LL", len(frame_bytes), active_camera_id)
                 client_socket.sendall(header + frame_bytes)
                 frame_count += 1
                 if frame_count % 150 == 0:
