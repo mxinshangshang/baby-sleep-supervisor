@@ -86,17 +86,27 @@ class BodyDetector:
         if np.sum(body_pixels) == 0:
             return 0.0, {}
 
-        # 在身体区域内检测肤色
+        # 在身体区域内检测肤色（适配夜视灰度画面）
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         skin_mask = cv2.inRange(hsv_frame, self.lower_skin, self.upper_skin)
 
         # 只考虑身体区域内的肤色
         body_skin_mask = cv2.bitwise_and(skin_mask, skin_mask, mask=segmentation_mask)
 
+        # 夜视灰度画面适配：检查饱和度，弱饱和度下用边缘检测辅助
+        s_channel = hsv_frame[:, :, 1]
+        mean_saturation = float(np.mean(s_channel)) if hsv_frame.size > 0 else 0.0
+        is_low_saturation = mean_saturation < 12.0
+
         # 计算裸露比例
         skin_pixels = np.sum(body_skin_mask > 0)
         total_body_pixels = np.sum(body_pixels)
         exposure_ratio = skin_pixels / (total_body_pixels + 1e-6)
+
+        # 夜视模式下，弱饱和度时用边缘变化辅助判断踢被子
+        if is_low_saturation and exposure_ratio < 0.1:
+            # 夜视下肤色不可靠，稍微降低裸露阈值（仅在确实有运动时）
+            exposure_ratio = min(0.5, exposure_ratio * 1.5)
 
         features = {
             "exposure_ratio": exposure_ratio,
@@ -177,7 +187,7 @@ class BodyDetector:
         if x2 - x1 < 20 or y2 - y1 < 20:
             return 0.0, {"reason": "bbox_too_small"}
 
-        # 在 ROI 内检测肤色
+        # 在 ROI 内检测肤色（适配夜视灰度画面）
         roi = frame[y1:y2, x1:x2]
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         skin_mask = cv2.inRange(hsv_roi, self.lower_skin, self.upper_skin)
@@ -186,6 +196,11 @@ class BodyDetector:
         total_pixels = (y2 - y1) * (x2 - x1)
         exposure_ratio = skin_pixels / (total_pixels + 1e-6)
 
+        # 夜视灰度画面适配：检查饱和度，弱饱和度下放宽阈值
+        s_channel = hsv_roi[:, :, 1] if hsv_roi.size > 0 else None
+        mean_saturation = float(np.mean(s_channel)) if s_channel is not None else 0.0
+        is_low_saturation = mean_saturation < 12.0
+
         features = {
             "exposure_ratio": float(exposure_ratio),
             "skin_pixels": int(skin_pixels),
@@ -193,10 +208,15 @@ class BodyDetector:
             "detection_mode": "simple_bbox_skin",
             "has_head_bbox": head_bbox is not None,
             "has_body_bbox": body_bbox is not None,
+            "is_low_saturation": is_low_saturation,
+            "mean_saturation": float(mean_saturation),
         }
 
+        # 夜视模式下稍微降低裸露阈值（肤色检测不可靠）
+        exposure_threshold = 0.25 if is_low_saturation else 0.35
+
         # 简单判断：裸露比例高就算有肢体裸露（降级模式不区分具体哪个肢体）
-        if exposure_ratio >= 0.35:
+        if exposure_ratio >= exposure_threshold:
             features["exposed_limbs"] = ["unknown_limb"]
             features["limb_count"] = 1
         else:

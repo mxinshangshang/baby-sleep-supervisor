@@ -570,7 +570,7 @@ class FaceDetector:
         mouth_x2 = int(min(w, max(mouth_right[0], nose_tip[0]) + 10))
         mouth_y2 = int(min(h, mouth_bottom[1] + 10))
 
-        # ========== 3. 肤色检测（加宽范围，减少光照误判）==========
+        # ========== 3. 肤色检测（加宽范围，减少光照误判，适配夜视）==========
         lower_skin = np.array([0, 10, 40], dtype=np.uint8)
         upper_skin = np.array([30, 255, 255], dtype=np.uint8)
 
@@ -587,6 +587,15 @@ class FaceDetector:
             skin_mask_mouth = cv2.inRange(hsv_mouth, lower_skin, upper_skin)
             mouth_skin_ratio = np.sum(skin_mask_mouth > 0) / (skin_mask_mouth.size + 1e-6)
             mouth_non_skin_ratio = 1.0 - mouth_skin_ratio
+
+        # 夜视灰度画面适配：检查饱和度，弱饱和度下弱化肤色依赖
+        s_channel = hsv_face[:, :, 1]
+        mean_saturation = float(np.mean(s_channel))
+        is_low_saturation = mean_saturation < 12.0
+        if is_low_saturation:
+            # 夜视/灰度画面下，减少肤色在遮挡判断中的权重
+            face_non_skin_ratio *= 0.5
+            mouth_non_skin_ratio *= 0.5
 
         # ========== 4. FaceMesh 质量门控 ==========
         # 关键点越多 → 脸部越清晰可见 → 非皮肤更可能是阴影而非遮挡

@@ -679,6 +679,13 @@ class SleepSupervisor:
         if head_bbox and pose_head_bbox:
             head_pose_consistent = self._bbox_distance_norm(head_bbox, pose_head_bbox) < 1.25
 
+        # 简单的人脸-人体位置一致性记录（仅用于诊断，不影响检测）
+        face_body_consistent = True
+        if face_anchor and head_bbox and body_bbox:
+            face_cy = (head_bbox[1] + head_bbox[3]) / 2
+            body_cy = (body_bbox[1] + body_bbox[3]) / 2
+            face_body_consistent = face_cy < body_cy + (body_bbox[3] - body_bbox[1]) * 0.5
+
         axis_confidence = 0.0
         axis_angle = None
         if head_center and (torso_center or body_center):
@@ -729,6 +736,7 @@ class SleepSupervisor:
             "axis_angle": axis_angle,
             "axis_confidence": axis_confidence,
             "head_pose_consistent": head_pose_consistent,
+            "face_body_consistent": face_body_consistent,
             "topology_reliable": topology_reliable,
             "posture": posture,
             "nearby_hands": nearby_hands,
@@ -1051,18 +1059,27 @@ class SleepSupervisor:
         hands = []
         pose_data = self.body_detector.detect_pose(detect_frame, rgb_frame) if (self.exposure_enabled or self.region_enabled) else None
         pose_summary = self._summarize_pose(pose_data, original_frame.shape)
-        if self.occlusion_enabled and pose_summary.get("head_bbox"):
+
+        # 优先用BlazeFace检测到的人脸作为关键点检测的提示框，而不是Pose的head_bbox
+        # 这样可以防止追踪到大人的脸
+        face_hint_bbox = None
+        if faces:
+            face_hint_bbox = faces[0]["bbox"]  # BlazeFace返回的第一个人脸（最大）
+        elif pose_summary.get("head_bbox"):
+            face_hint_bbox = pose_summary.get("head_bbox")
+
+        if self.occlusion_enabled and face_hint_bbox:
             should_detect_hands = (
                 not self._last_facemesh_ok  # FaceMesh不可用时每帧跑
                 or now - self.hands_cache_time >= self.hands_detect_interval_s
             )
             if should_detect_hands:
-                hands = self.face_detector.detect_hands_near_head(detect_frame, pose_summary.get("head_bbox"), rgb_frame)
+                hands = self.face_detector.detect_hands_near_head(detect_frame, face_hint_bbox, rgb_frame)
                 self.hands_cache = hands
                 self.hands_cache_time = now
             else:
                 hands = self.hands_cache
-        landmarks = self.face_detector.detect_face_landmarks(detect_frame, pose_summary.get("head_bbox"), rgb_frame) if (self.cry_enabled or self.occlusion_enabled) else None
+        landmarks = self.face_detector.detect_face_landmarks(detect_frame, face_hint_bbox, rgb_frame) if (self.cry_enabled or self.occlusion_enabled) else None
         self._last_facemesh_ok = landmarks is not None
         face_pose = self.face_detector.classify_face_orientation(landmarks)
         face_summary = self._summarize_face(faces, landmarks)
@@ -1382,16 +1399,21 @@ class SleepSupervisor:
                         })
                 else:
                     self.cry_start_time = None
-            elif in_region and self.audio_enabled and audio_features and presence["confirmed"] and audio_features.cry_confidence >= 0.4 and audio_features.is_crying:
+            elif in_region and self.audio_enabled and audio_features and presence["confirmed"] and audio_features.cry_confidence >= (0.35 if self.is_night_mode else 0.4) and audio_features.is_crying:
                 # 场景2：in_region 但 landmarks 不可用 / presence 未确认（盖被子/侧脸场景）
                 # 降级评估：音频 + 动作，不用人脸表情
                 motion_confidence = float(motion_features.get("agitation", 0.0))
                 limb_motion = float(motion_features.get("limb_motion", 0.0))
 
-                # 音频为主，动作为辅的融合逻辑（简单有效，无需表情）
+                # 音频为主，动作为辅的融合逻辑（夜视模式下更依赖音频）
                 base_confidence = audio_features.cry_confidence
-                if motion_confidence >= 0.3 or limb_motion >= 0.25:
-                    base_confidence = min(0.95, base_confidence + 0.15)  # 有动作加持，提高置信度
+                if self.is_night_mode:
+                    # 夜视模式下：更依赖音频，降低动作要求
+                    if motion_confidence >= 0.2 or limb_motion >= 0.15:
+                        base_confidence = min(0.95, base_confidence + 0.1)
+                else:
+                    if motion_confidence >= 0.3 or limb_motion >= 0.25:
+                        base_confidence = min(0.95, base_confidence + 0.15)
 
                 smoothed_cry = self._get_smoothed_value(self.cry_confidence_window, base_confidence)
 
@@ -1790,41 +1812,52 @@ class SleepSupervisor:
                 "exit_pending_s": 0.0,
             }
 
-            # 离开窗口：两种情况都算离开信号
-            # 1. 确认有人但不在区域
-            # 2. 完全没有检测信号，但只有之前确认过有人时才算（宝宝真的走了）
+            # 离开窗口：只有明确看到人但不在区域才算离开信号
+            # 无检测信号时（被子挡住、侧脸等），不算离开信号，避免误报
             no_detection = not has_any_detection
-            # 只有之前确认过有人，且现在完全没信号，才算离开信号
             no_detection_exit = no_detection and (self.last_in_region is True or self.last_confirmed_presence_time > 0)
 
-            # 夜视模式特殊处理：更保守
+            # 夜视模式特殊处理：更保守，但也只在明确看到人离开或真的看不到人较长时间时才触发
+            # 先定义变量供后面使用
+            time_since_last_presence = now - self.last_confirmed_presence_time
+            no_detection_but_recently_present = no_detection and time_since_last_presence < 3
             if self.is_night_mode:
                 # 夜视模式下：
                 # 1. 确认有人且不在区域 → 算离开信号
                 # 2. 无检测信号但最近3秒内确实检测到宝宝 → 也算离开信号（防止抱走时漏报）
-                time_since_last_presence = now - self.last_confirmed_presence_time
-                no_detection_but_recently_present = no_detection and time_since_last_presence < 3
 
                 self.region_exit_window.append(
                     (not in_region and presence["confirmed"]) or
-                    no_detection_but_recently_present
+                    (no_detection_but_recently_present and self.last_in_region is True)
                 )
                 exit_ratio = sum(1 for v in self.region_exit_window if v) / len(self.region_exit_window)
 
                 # 夜视模式下要求合理的确认比例
                 confirmed_exit = (
                     (presence["confirmed"] and not in_region and exit_ratio >= 0.85) or
-                    (no_detection_but_recently_present and exit_ratio >= 0.9)
+                    (no_detection_but_recently_present and self.last_in_region is True and exit_ratio >= 0.9)
                 )
             else:
-                # 日间模式：保持原有逻辑
-                self.region_exit_window.append((not in_region and presence["confirmed"]) or no_detection_exit)
-                exit_ratio = sum(1 for v in self.region_exit_window if v) / len(self.region_exit_window)
-                confirmed_exit = (
-                    (presence["confirmed"] and not in_region and exit_ratio >= self.region_exit_confirm_ratio)
-                    or
-                    (no_detection_exit and exit_ratio >= 0.8)  # 完全没信号且之前有人时，更快确认离开
+                # ⭐ 日间模式：
+                # 1. 明确看到人但不在区域 → 离开信号
+                # 2. 上一帧还在区域内，现在完全看不到人了 → 也算离开信号（宝宝走出画面）
+                # 注意：条件2比条件1要求更高的窗口比例，防止误报
+                # time_since_last_presence 已经在前面定义了
+                no_detection_but_recently_in_region = (
+                    no_detection and
+                    self.last_in_region is True and
+                    time_since_last_presence < 4  # 4秒内还能记着宝宝在区域内
                 )
+                self.region_exit_window.append(
+                    (not in_region and presence["confirmed"]) or
+                    no_detection_but_recently_in_region
+                )
+                exit_ratio = sum(1 for v in self.region_exit_window if v) / len(self.region_exit_window)
+
+                # 两种情况分开判断：
+                confirmed_exit_visual = presence["confirmed"] and not in_region and exit_ratio >= self.region_exit_confirm_ratio
+                confirmed_exit_gone = no_detection_but_recently_in_region and exit_ratio >= 0.8  # 完全消失需要更高确认度
+                confirmed_exit = confirmed_exit_visual or confirmed_exit_gone
             confirmed_in = (
                 presence["confirmed"]
                 and in_region
@@ -1840,16 +1873,15 @@ class SleepSupervisor:
             # 【边缘触发 + 证据预缓存】区域事件通知
             # ============================================================
 
-            # 不在区域内：清空离开和进入的缓存照片
-            if not in_region:
-                self.region_exit_candidate_photo = None
-                self.region_enter_candidate_photo = None  # 也清空进入的缓存，防止误用旧照片
-                # 初始化：如果 last_in_region 还是 None，说明是系统启动后首次判定
-                if self.last_in_region is None:
-                    self.last_in_region = False
+            # 初始化：如果 last_in_region 还是 None，说明是系统启动后首次判定
+            if self.last_in_region is None:
+                if in_region:
+                    self.last_in_region = True  # 启动时宝宝在区域内，只初始化状态
+                else:
+                    self.last_in_region = False  # 启动时宝宝不在区域内，也只初始化
 
             # 可能离开区域：检测到离开迹象 → 帧计数防抖 → 确认后发通知
-            elif confirmed_exit:
+            if confirmed_exit:
                 if self.region_exit_frames == 0:
                     # 第0帧：刚检测到离开迹象 → 立即抓拍作为证据
                     self.region_exit_frames = 1
@@ -1863,12 +1895,14 @@ class SleepSupervisor:
                 elif self.region_exit_frames >= self.region_confirm_frames:
                         # 确认后：用缓存的照片（状态刚变化时的那一帧）发送通知
                         should_notify_exit = self.last_in_region is not False
-                        # 夜视模式下额外检查：必须一段时间没看到人才触发
-                        if self.is_night_mode:
+
+                        # 夜视模式下，只对"无检测信号"的情况做时间限制
+                        if self.is_night_mode and no_detection_but_recently_present:
                             time_since_last_presence = now - self.last_confirmed_presence_time
-                            # 夜视模式下，至少5秒没看到人才触发离开警报（6帧约2秒，稍微放宽一点）
-                            if time_since_last_presence < 5:
+                            # 对于看不到人的情况，稍微等一下确认（2秒），避免误报
+                            if time_since_last_presence < 2:
                                 should_notify_exit = False
+
                         if should_notify_exit and self.region_exit_candidate_photo is not None:
                             photo_path = self.storage.save_photo(self.region_exit_candidate_photo, now)
                             event_id = self.storage.save_event(

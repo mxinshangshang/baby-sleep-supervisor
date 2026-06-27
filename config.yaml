@@ -50,14 +50,14 @@ detection:
   region_exit_window_size: 6
   region_torso_overlap_threshold: 0.5
   safe_region:
-  - - 428
-    - 229
-  - - 939
-    - 40
-  - - 950
-    - 534
-  - - 425
-    - 449
+  - - 441
+    - 214
+  - - 947
+    - 16
+  - - 953
+    - 532
+  - - 411
+    - 428
 detection_night:
   night_brightness_offset: 10
   night_clahe_clip_limit: 3.0
