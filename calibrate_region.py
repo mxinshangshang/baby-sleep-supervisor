@@ -29,12 +29,23 @@ from src.config import CONFIG_PATH
 ALERT_OPTIONS = [
     ("cry_detected", "Crying"),
     ("occlusion_detected", "Face covered"),
-    ("limb_exposure", "Limb exposed / kick blanket"),
+    ("limb_exposure", "Limb exposed"),
     ("region_exit", "Out of safe region"),
     ("region_enter", "Enter safe region"),
     ("prone_detected", "Prone sleeping risk"),
     ("face_not_visible", "Face not visible"),
 ]
+
+# 告警类型到检测开关的映射
+ALERT_TO_DETECTION_FLAGS = {
+    "cry_detected": ["cry_detection_enabled"],
+    "occlusion_detected": ["occlusion_detection_enabled"],
+    "limb_exposure": ["limb_exposure_enabled"],
+    "region_exit": ["region_detection_enabled"],
+    "region_enter": ["region_detection_enabled"],
+    "prone_detected": ["prone_detection_enabled"],
+    "face_not_visible": ["face_absence_detection_enabled"],
+}
 
 
 class RegionCalibrator:
@@ -240,34 +251,123 @@ class RegionCalibrator:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         selected = param
-        for index, (event_type, _) in enumerate(ALERT_OPTIONS):
-            y1 = 93 + index * 45
-            if 40 <= x <= 560 and y1 <= y <= y1 + 35:
+
+        mid = len(ALERT_OPTIONS) // 2 + 1
+        col1 = ALERT_OPTIONS[:mid]
+        col2 = ALERT_OPTIONS[mid:]
+
+        # 检查第一列
+        for index, (event_type, _) in enumerate(col1):
+            y_pos = 140 + index * 50
+            if 40 <= x <= 300 and (y_pos - 25) <= y <= (y_pos + 15):
                 if event_type in selected:
                     selected.remove(event_type)
                 else:
                     selected.add(event_type)
+                return
+
+        # 检查第二列
+        for offset, (event_type, _) in enumerate(col2):
+            y_pos = 140 + offset * 50
+            if 320 <= x <= 600 and (y_pos - 25) <= y <= (y_pos + 15):
+                if event_type in selected:
+                    selected.remove(event_type)
+                else:
+                    selected.add(event_type)
+                return
 
     def draw_notification_options(self, selected):
-        frame = np.full((360, 620, 3), 245, dtype=np.uint8)
-        cv2.putText(frame, "Select Feishu alert types", (35, 45),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (30, 30, 30), 2)
-        cv2.putText(frame, "Click or press 1-4 to toggle, Enter/s to save", (35, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1)
+        frame = np.full((460, 640, 3), 248, dtype=np.uint8)
 
-        for index, (event_type, label) in enumerate(ALERT_OPTIONS):
-            y = 115 + index * 45
+        # 标题
+        cv2.putText(frame, "Select Feishu Alert Types", (40, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (40, 40, 40), 2)
+        cv2.putText(frame, "What you select = What will be detected & notified", (40, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+
+        # 分隔线
+        cv2.line(frame, (30, 95), (610, 95), (200, 200, 200), 1)
+
+        # 两列布局
+        mid = len(ALERT_OPTIONS) // 2 + 1
+        col1 = ALERT_OPTIONS[:mid]
+        col2 = ALERT_OPTIONS[mid:]
+
+        # 第一列
+        for index, (event_type, label) in enumerate(col1):
+            y = 140 + index * 50
             checked = event_type in selected
-            cv2.rectangle(frame, (45, y - 22), (72, y + 5), (40, 40, 40), 2)
-            if checked:
-                cv2.line(frame, (51, y - 9), (59, y), (0, 140, 0), 3)
-                cv2.line(frame, (59, y), (70, y - 18), (0, 140, 0), 3)
-            cv2.putText(frame, f"{index + 1}. {label}", (90, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 30, 30), 2)
 
-        cv2.putText(frame, "a: select all   n: select none   q: skip", (35, 325),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+            # 复选框
+            cv2.rectangle(frame, (50, y - 20), (80, y + 10), (60, 60, 60), 2)
+            if checked:
+                cv2.line(frame, (57, y - 10), (66, y), (0, 150, 0), 3)
+                cv2.line(frame, (66, y), (78, y - 16), (0, 150, 0), 3)
+
+            # 数字和标签
+            cv2.putText(frame, f"{index + 1}.", (95, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 80, 80), 1)
+            cv2.putText(frame, label, (130, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 30, 30), 1)
+
+        # 第二列
+        for offset, (event_type, label) in enumerate(col2):
+            index = mid + offset
+            y = 140 + offset * 50
+            checked = event_type in selected
+
+            # 复选框
+            cv2.rectangle(frame, (330, y - 20), (360, y + 10), (60, 60, 60), 2)
+            if checked:
+                cv2.line(frame, (337, y - 10), (346, y), (0, 150, 0), 3)
+                cv2.line(frame, (346, y), (358, y - 16), (0, 150, 0), 3)
+
+            # 数字和标签
+            cv2.putText(frame, f"{index + 1}.", (375, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 80, 80), 1)
+            cv2.putText(frame, label, (410, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 30, 30), 1)
+
+        # 底部分隔线
+        cv2.line(frame, (30, 390), (610, 390), (200, 200, 200), 1)
+
+        # 底部操作提示
+        cv2.putText(frame, "Keyboard shortcuts:", (40, 420),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
+        cv2.putText(frame, "1-7: toggle   a: all   n: none   Enter/s: save   q: skip", (40, 445),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 60), 1)
+
         return frame
+
+    def _sync_detection_flags(self, enabled_alerts):
+        """根据选择的告警类型自动同步检测开关"""
+        detect_cfg = self.config.setdefault("detection", {})
+
+        # 首先收集所有需要开启的检测项
+        flags_to_enable = set()
+        for alert_type in enabled_alerts:
+            flags_to_enable.update(ALERT_TO_DETECTION_FLAGS.get(alert_type, []))
+
+        # 根据是否需要来设置开关
+        # 1. Cry detection
+        detect_cfg["cry_detection_enabled"] = "cry_detection_enabled" in flags_to_enable
+        # 2. Occlusion detection
+        detect_cfg["occlusion_detection_enabled"] = "occlusion_detection_enabled" in flags_to_enable
+        # 3. Limb exposure detection
+        detect_cfg["limb_exposure_enabled"] = "limb_exposure_enabled" in flags_to_enable
+        # 4. Region detection (both exit and enter need this)
+        detect_cfg["region_detection_enabled"] = "region_detection_enabled" in flags_to_enable
+        # 5. Prone detection
+        detect_cfg["prone_detection_enabled"] = "prone_detection_enabled" in flags_to_enable
+        # 6. Face absence detection
+        detect_cfg["face_absence_detection_enabled"] = "face_absence_detection_enabled" in flags_to_enable
+
+        print(f"Synced detection flags:")
+        for flag in ["cry_detection_enabled", "occlusion_detection_enabled",
+                     "limb_exposure_enabled", "region_detection_enabled",
+                     "prone_detection_enabled", "face_absence_detection_enabled"]:
+            status = "ON" if detect_cfg.get(flag, False) else "OFF"
+            print(f"  {flag:30s}: {status}")
 
     def configure_notification_alerts(self):
         notify_cfg = self.config.setdefault("notification", {})
@@ -283,7 +383,11 @@ class RegionCalibrator:
             key = cv2.waitKey(50) & 0xFF
 
             if key in (13, 10, ord('s')):
+                # 保存通知设置
                 notify_cfg["enabled_alert_types"] = [event_type for event_type, _ in ALERT_OPTIONS if event_type in selected]
+                # 自动同步检测开关
+                self._sync_detection_flags(notify_cfg["enabled_alert_types"])
+                # 保存配置
                 if self.save_config():
                     print(f"Enabled Feishu alert types: {notify_cfg['enabled_alert_types']}")
                 cv2.destroyWindow("Notification Alerts")
