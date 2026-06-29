@@ -142,7 +142,7 @@ class CameraRouter:
             logger.info(f"切换完成 {old_id} -> {target_id}，耗时 {elapsed_ms}ms")
             if self._storage:
                 try:
-                    self._storage.save_event(event_type="camera_switch", level="info", message=f"camera switch {old_id}->{target_id}", payload={"from": old_id, "to": target_id, "reason": reason, "elapsed_ms": elapsed_ms}, update_stats=False)
+                    self._storage.save_event(event_type="camera_switch", level="info", message=f"camera switch {old_id}->{target_id}", details={"from": old_id, "to": target_id, "reason": reason, "elapsed_ms": elapsed_ms}, update_stats=False)
                 except Exception:
                     pass
             return True
@@ -150,7 +150,7 @@ class CameraRouter:
             logger.error(f"切换失败，保持cam{self._active_id}: {e}")
             if self._storage:
                 try:
-                    self._storage.save_event(event_type="camera_switch_error", level="warning", message=f"camera switch failed", payload={"from": old_id, "to": target_id, "reason": reason, "error": str(e)}, update_stats=False)
+                    self._storage.save_event(event_type="camera_switch_error", level="warning", message=f"camera switch failed", details={"from": old_id, "to": target_id, "reason": reason, "error": str(e)}, update_stats=False)
                 except Exception:
                     pass
             return False
