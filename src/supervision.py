@@ -1399,73 +1399,85 @@ class SleepSupervisor:
                         })
                 else:
                     self.cry_start_time = None
-            elif in_region and self.audio_enabled and audio_features and presence["confirmed"] and audio_features.cry_confidence >= (0.35 if self.is_night_mode else 0.4) and audio_features.is_crying:
-                # 场景2：in_region 但 landmarks 不可用 / presence 未确认（盖被子/侧脸场景）
-                # 降级评估：音频 + 动作，不用人脸表情
-                motion_confidence = float(motion_features.get("agitation", 0.0))
-                limb_motion = float(motion_features.get("limb_motion", 0.0))
-
-                # 音频为主，动作为辅的融合逻辑（夜视模式下更依赖音频）
-                base_confidence = audio_features.cry_confidence
-                if self.is_night_mode:
-                    # 夜视模式下：更依赖音频，降低动作要求
-                    if motion_confidence >= 0.2 or limb_motion >= 0.15:
-                        base_confidence = min(0.95, base_confidence + 0.1)
-                else:
-                    if motion_confidence >= 0.3 or limb_motion >= 0.25:
-                        base_confidence = min(0.95, base_confidence + 0.15)
-
-                smoothed_cry = self._get_smoothed_value(self.cry_confidence_window, base_confidence)
-
-                results["detections"]["cry"] = {
-                    "confidence": smoothed_cry,
-                    "status": "audio_motion_only",
-                    "reason": "in_region_but_landmarks_or_presence_unconfirmed",
-                    "features": {
-                        "audio_confidence": audio_features.cry_confidence,
-                        "motion_confidence": motion_confidence,
-                        "limb_motion": limb_motion,
-                    },
-                    "fused": True
-                }
-                if smoothed_cry >= self.cry_threshold:
-                    self.last_cry_confidence = smoothed_cry
-                    self.last_cry_time = now
-                # 音频为主的降级模式，用时间防抖（音频独立）
-                if smoothed_cry >= self.cry_threshold:
-                    if self.cry_start_time is None:
-                        self.cry_start_time = now
-                    elif now - self.cry_start_time >= 1.5 and self._should_alert("cry_detected"):
-                        photo_path = self.storage.save_photo(original_frame, now) if frame is not None else None
-                        audio_ctx = self._build_alert_context(audio_features)
-                        event_id = self.storage.save_event(
-                            event_type="cry_detected",
-                            level="warning",
-                            message=f"麦克风检测到哭声（侧脸/盖被子模式），置信度 {smoothed_cry:.2f}",
-                            details={"detection_mode": "audio_motion_only", **audio_ctx},
-                            photo_path=photo_path
-                        )
-                        self.notifier.send_alert(
-                            event_type="cry_detected",
-                            level="warning",
-                            message="婴儿哭声（侧脸/盖被子模式）",
-                            photo_path=photo_path,
-                            details={
-                                "置信度": f"{smoothed_cry:.2f}",
-                                "检测模式": "音频+动作（无人脸表情）",
-                                "事件ID": event_id,
-                                **audio_ctx
-                            }
-                        )
-                        results["events"].append({
-                            "type": "cry_detected",
-                            "level": "warning",
-                            "source": "audio_motion_fusion",
-                            "confidence": smoothed_cry,
-                            "event_id": event_id,
-                        })
-                else:
+            elif self.audio_enabled and audio_features and audio_features.cry_confidence >= (0.3 if self.is_night_mode else 0.4) and audio_features.is_crying:
+                # 场景2：音频检测到哭声
+                # 夜间模式不要求 presence/in_region（宝宝可能哭着爬出安全区）
+                # 白天模式要求至少有 presence 或 in_region
+                if not self.is_night_mode and not (presence["confirmed"] or in_region):
                     self.cry_start_time = None
+                    results["detections"]["cry"] = {
+                        "confidence": 0.0,
+                        "status": "skipped_no_presence",
+                        "reason": "daytime_requires_presence_or_in_region",
+                        "features": {},
+                        "fused": False
+                    }
+                else:
+                    # 降级评估：音频 + 动作，不用人脸表情
+                    motion_confidence = float(motion_features.get("agitation", 0.0))
+                    limb_motion = float(motion_features.get("limb_motion", 0.0))
+
+                    # 音频为主，动作为辅的融合逻辑（夜视模式下更依赖音频）
+                    base_confidence = audio_features.cry_confidence
+                    if self.is_night_mode:
+                        # 夜视模式下：更依赖音频，降低动作要求
+                        if motion_confidence >= 0.2 or limb_motion >= 0.15:
+                            base_confidence = min(0.95, base_confidence + 0.1)
+                    else:
+                        if motion_confidence >= 0.3 or limb_motion >= 0.25:
+                            base_confidence = min(0.95, base_confidence + 0.15)
+
+                    smoothed_cry = self._get_smoothed_value(self.cry_confidence_window, base_confidence)
+
+                    results["detections"]["cry"] = {
+                        "confidence": smoothed_cry,
+                        "status": "audio_motion_only",
+                        "reason": "in_region_but_landmarks_or_presence_unconfirmed",
+                        "features": {
+                            "audio_confidence": audio_features.cry_confidence,
+                            "motion_confidence": motion_confidence,
+                            "limb_motion": limb_motion,
+                        },
+                        "fused": True
+                    }
+                    if smoothed_cry >= self.cry_threshold:
+                        self.last_cry_confidence = smoothed_cry
+                        self.last_cry_time = now
+                    # 音频为主的降级模式，用时间防抖（音频独立）
+                    if smoothed_cry >= self.cry_threshold:
+                        if self.cry_start_time is None:
+                            self.cry_start_time = now
+                        elif now - self.cry_start_time >= 1.5 and self._should_alert("cry_detected"):
+                            photo_path = self.storage.save_photo(original_frame, now) if frame is not None else None
+                            audio_ctx = self._build_alert_context(audio_features)
+                            event_id = self.storage.save_event(
+                                event_type="cry_detected",
+                                level="warning",
+                                message=f"麦克风检测到哭声（侧脸/盖被子模式），置信度 {smoothed_cry:.2f}",
+                                details={"detection_mode": "audio_motion_only", **audio_ctx},
+                                photo_path=photo_path
+                            )
+                            self.notifier.send_alert(
+                                event_type="cry_detected",
+                                level="warning",
+                                message="婴儿哭声（侧脸/盖被子模式）",
+                                photo_path=photo_path,
+                                details={
+                                    "置信度": f"{smoothed_cry:.2f}",
+                                    "检测模式": "音频+动作（无人脸表情）",
+                                    "事件ID": event_id,
+                                    **audio_ctx
+                                }
+                            )
+                            results["events"].append({
+                                "type": "cry_detected",
+                                "level": "warning",
+                                "source": "audio_motion_fusion",
+                                "confidence": smoothed_cry,
+                                "event_id": event_id,
+                            })
+                    else:
+                        self.cry_start_time = None
             else:
                 # 场景3：不在区，完全交给后面的纯音频快速通道处理
                 self.cry_start_time = None

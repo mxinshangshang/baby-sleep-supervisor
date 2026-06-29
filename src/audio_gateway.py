@@ -51,11 +51,11 @@ class LightweightCryDetector:
         self.frame_size = int(sample_rate * 0.5)  # 500ms 帧
 
         # 哭声声学特征阈值（优化：降低音量阈值，提高灵敏度）
-        self.volume_threshold = 0.008  # 从0.05降低，提高对小声哭闹的检测
-        self.pitch_min = 250    # Hz，扩大范围
-        self.pitch_max = 1500   # Hz，扩大范围
-        self.centroid_min = 500 # Hz，扩大范围
-        self.centroid_max = 4000 # Hz，扩大范围
+        self.volume_threshold = 0.005  # 进一步降低，提高对小声哭闹的检测
+        self.pitch_min = 200    # Hz，扩大范围
+        self.pitch_max = 2000   # Hz，扩大范围
+        self.centroid_min = 300 # Hz，扩大范围
+        self.centroid_max = 5000 # Hz，扩大范围
 
         # 降噪参数
         self.noise_reduction_enabled = True
@@ -217,7 +217,7 @@ class LightweightCryDetector:
         if len(self.volume_history) >= 3:
             # 当前帧是局部峰值（比前后都高且超过阈值）
             is_peak = (
-                self.volume_history[-2] > self.volume_threshold * 1.5  # 峰值本身够大
+                self.volume_history[-2] > self.volume_threshold * 1.2  # 峰值要求降低
                 and self.volume_history[-2] > self.volume_history[-3]
                 and self.volume_history[-2] > self.volume_history[-1]
             )
@@ -278,13 +278,19 @@ class LightweightCryDetector:
         latency_ms = (time.time() - start_time) * 1000
         self.seq += 1
 
+        # 降低 is_crying 阈值，提高灵敏度
+        is_crying_flag = bool(
+            smoothed_confidence >= 0.4
+            or (acoustic_confidence >= 0.5 and rhythm_score >= 0.3)
+            or burst_count >= 2
+        )
         return AudioFeatures(
             timestamp=current_timestamp,
             seq=self.seq,
             rms_volume=float(volume),
             cry_confidence=float(smoothed_confidence),
             cry_pattern_match=float(pattern_match),
-            is_crying=bool(smoothed_confidence >= 0.5),
+            is_crying=is_crying_flag,
             processing_latency_ms=float(latency_ms),
             # ===== P0 新增字段，用于调试展示 =====
             rhythm_score=float(rhythm_score),
